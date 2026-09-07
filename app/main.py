@@ -5,8 +5,11 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
 from app.core.config import get_settings
@@ -45,6 +48,16 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(api_router)
+    static_directory = Path(__file__).resolve().parent / "static"
+    app.mount("/static", StaticFiles(directory=static_directory), name="static")
+
+    @app.get("/", response_class=FileResponse, include_in_schema=False)
+    async def dashboard() -> FileResponse:
+        return FileResponse(
+            static_directory / "index.html",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
     return app
 
 

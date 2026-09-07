@@ -29,7 +29,29 @@ class ProcessNotFoundError(Exception):
     """Raised when a target process cannot be located."""
 
 
-def _to_process_info(proc: psutil.Process) -> ProcessInfo | None:
+class _FirewallRuleError(Exception):
+    pass
+
+
+def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, _FirewallRuleError):
+        return str(exc)
+    if isinstance(exc, (psutil.AccessDenied, PermissionError)):
+        return "Permission denied. Administrator privileges may be required."
+    if isinstance(exc, subprocess.CalledProcessError):
+        return f"The firewall command failed (exit code {exc.returncode}). Administrator privileges may be required."
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "The firewall command timed out; the last rule may have been applied. Check firewall state before retrying."
+    if isinstance(exc, psutil.TimeoutExpired):
+        return "Timed out waiting for the process to exit; termination could not be confirmed."
+    if isinstance(exc, TimeoutError):
+        return "The operation timed out; its outcome could not be confirmed. Check system state before retrying."
+    if isinstance(exc, OSError):
+        return "The operating system could not complete the operation. Check permissions and required system tools."
+    return "The firewall command could not be completed. Check firewall state before retrying."
+
+
+def _to_process_info(proc: psutil.Process, *, strict: bool = False) -> ProcessInfo | None:
     """Build a `ProcessInfo` snapshot from a live `psutil.Process`, or None if it has vanished."""
     try:
         with proc.oneshot():
@@ -42,7 +64,9 @@ def _to_process_info(proc: psutil.Process) -> ProcessInfo | None:
                 memory_rss_mb=round(memory_info.rss / (1024 * 1024), 2),
                 status=proc.status(),
             )
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, PermissionError):
+        if strict:
+            raise
         return None
 
 
@@ -98,14 +122,16 @@ def _find_process_sync(pid: int | None, name: str | None) -> psutil.Process | No
     return None
 
 
-def _terminate_sync(pid: int) -> ProcessInfo:
+def _terminate_sync(pid: int, dry_run: bool = False) -> ProcessInfo:
     proc = psutil.Process(pid)
     if is_protected_process(proc.name()):
         raise ProtectedProcessError(f"Refusing to terminate protected process '{proc.name()}' (pid={pid}).")
 
-    info = _to_process_info(proc)
+    info = _to_process_info(proc, strict=True)
     if info is None:
         raise ProcessNotFoundError(f"Process {pid} no longer exists.")
+    if dry_run:
+        return info
 
     proc.terminate()
     try:
@@ -116,12 +142,12 @@ def _terminate_sync(pid: int) -> ProcessInfo:
     return info
 
 
-def _isolate_network_sync(pid: int) -> tuple[ProcessInfo, list[str]]:
+def _isolate_network_sync(pid: int, dry_run: bool = False) -> tuple[ProcessInfo, list[str]]:
     proc = psutil.Process(pid)
     if is_protected_process(proc.name()):
         raise ProtectedProcessError(f"Refusing to network-isolate protected process '{proc.name()}' (pid={pid}).")
 
-    info = _to_process_info(proc)
+    info = _to_process_info(proc, strict=True)
     if info is None:
         raise ProcessNotFoundError(f"Process {pid} no longer exists.")
 
@@ -133,8 +159,23 @@ def _isolate_network_sync(pid: int) -> tuple[ProcessInfo, list[str]]:
         }
     )
 
-    for ip in remote_ips:
-        _block_ip(ip)
+    if not dry_run:
+        blocked_ips: list[str] = []
+        for ip in remote_ips:
+            try:
+                _block_ip(ip)
+            except (subprocess.SubprocessError, OSError) as exc:
+                message = f"Failed to install outbound firewall rule for {ip}. {_failure_reason(exc)}"
+                if blocked_ips:
+                    message += (
+                        f" Partial firewall changes: rules already installed for {', '.join(blocked_ips)}"
+                        "; these rules remain in place and were not rolled back."
+                    )
+                else:
+                    message += " No firewall rules were confirmed installed."
+                message += " Remaining rules were not attempted."
+                raise _FirewallRuleError(message) from exc
+            blocked_ips.append(ip)
 
     return info, remote_ips
 
@@ -162,6 +203,7 @@ def _block_ip(ip: str) -> None:
             )
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning("Failed to install firewall rule for %s: %s", ip, exc)
+        raise
 
 
 async def get_system_telemetry(top_limit: int = 5) -> SystemTelemetry:
@@ -190,22 +232,33 @@ async def terminate_process(pid: int, dry_run: bool = False) -> ExecutionResult:
     Raises `ProtectedProcessError` if `pid` belongs to a protected process, and
     `ProcessNotFoundError` if `pid` does not resolve to a live process.
     """
+    try:
+        info = await asyncio.to_thread(_terminate_sync, pid, dry_run)
+    except psutil.NoSuchProcess as exc:
+        raise ProcessNotFoundError(f"Process {pid} no longer exists.") from exc
+    except (psutil.AccessDenied, psutil.TimeoutExpired, subprocess.SubprocessError, OSError) as exc:
+        action = "preview termination of" if dry_run else "terminate"
+        message = f"Failed to {action} process (pid={pid}). {_failure_reason(exc)}"
+        if not dry_run:
+            message += " Termination was not confirmed; check process state before retrying."
+        return ExecutionResult(
+            success=False,
+            intent=IntentType.PROCESS_KILL,
+            message=message,
+            dry_run=dry_run,
+            affected_pid=pid,
+        )
+
     if dry_run:
-        info = await find_process(pid=pid)
-        if info is None:
-            raise ProcessNotFoundError(f"Process {pid} does not exist.")
-        if is_protected_process(info.name):
-            raise ProtectedProcessError(f"Refusing to terminate protected process '{info.name}' (pid={pid}).")
         return ExecutionResult(
             success=True,
             intent=IntentType.PROCESS_KILL,
-            message=f"[DRY RUN] Would terminate process '{info.name}' (pid={pid}).",
+            message=f"[DRY RUN] Would terminate process '{info.name}' (pid={pid}). Execution permissions are not verified.",
             dry_run=True,
             affected_pid=pid,
             affected_process_name=info.name,
         )
 
-    info = await asyncio.to_thread(_terminate_sync, pid)
     return ExecutionResult(
         success=True,
         intent=IntentType.PROCESS_KILL,
@@ -222,22 +275,30 @@ async def isolate_network(pid: int, dry_run: bool = False) -> ExecutionResult:
     Raises `ProtectedProcessError` if `pid` belongs to a protected process, and
     `ProcessNotFoundError` if `pid` does not resolve to a live process.
     """
+    try:
+        info, remote_ips = await asyncio.to_thread(_isolate_network_sync, pid, dry_run)
+    except psutil.NoSuchProcess as exc:
+        raise ProcessNotFoundError(f"Process {pid} no longer exists.") from exc
+    except (psutil.AccessDenied, psutil.TimeoutExpired, subprocess.SubprocessError, OSError, _FirewallRuleError) as exc:
+        action = "preview network isolation for" if dry_run else "isolate network access for"
+        return ExecutionResult(
+            success=False,
+            intent=IntentType.NETWORK_ISOLATE,
+            message=f"Failed to {action} process (pid={pid}). {_failure_reason(exc)}",
+            dry_run=dry_run,
+            affected_pid=pid,
+        )
+
     if dry_run:
-        info = await find_process(pid=pid)
-        if info is None:
-            raise ProcessNotFoundError(f"Process {pid} does not exist.")
-        if is_protected_process(info.name):
-            raise ProtectedProcessError(f"Refusing to network-isolate protected process '{info.name}' (pid={pid}).")
         return ExecutionResult(
             success=True,
             intent=IntentType.NETWORK_ISOLATE,
-            message=f"[DRY RUN] Would isolate network access for '{info.name}' (pid={pid}).",
+            message=f"[DRY RUN] Would isolate network access for '{info.name}' (pid={pid}). Execution permissions are not verified.",
             dry_run=True,
             affected_pid=pid,
             affected_process_name=info.name,
         )
 
-    info, remote_ips = await asyncio.to_thread(_isolate_network_sync, pid)
     ip_summary = ", ".join(remote_ips) if remote_ips else "no active remote connections"
     return ExecutionResult(
         success=True,

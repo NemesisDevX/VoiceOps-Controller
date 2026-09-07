@@ -6,7 +6,9 @@ All `psutil` calls are monkeypatched so these tests never touch the real host's 
 from __future__ import annotations
 
 import contextlib
+import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import psutil
 import pytest
@@ -221,3 +223,251 @@ async def test_isolate_network_blocks_active_remote_ips(monkeypatch: pytest.Monk
 
     assert result.success is True
     assert blocked_ips == ["10.0.0.9"]
+
+
+@pytest.fixture
+def sandbox_process(monkeypatch: pytest.MonkeyPatch):
+    fake = FakeProcess(pid=60001)
+    monkeypatch.setattr(psutil, "Process", Mock(return_value=fake))
+    monkeypatch.setattr(psutil, "pid_exists", Mock(return_value=True))
+    run = Mock(return_value=subprocess.CompletedProcess(args=[], returncode=0))
+    monkeypatch.setattr(system_engine.subprocess, "run", run)
+    return fake, run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [psutil.AccessDenied, PermissionError])
+@pytest.mark.parametrize("stage", ["terminate", "wait", "kill"])
+async def test_terminate_denied_returns_failed_result(monkeypatch, sandbox_process, error_type, stage) -> None:
+    fake, run = sandbox_process
+    if stage == "kill":
+        monkeypatch.setattr(fake, "wait", Mock(side_effect=psutil.TimeoutExpired(3, pid=fake.pid)))
+    monkeypatch.setattr(fake, stage, Mock(side_effect=error_type("private OS details")))
+
+    result = await system_engine.terminate_process(fake.pid)
+
+    assert result.success is False
+    assert result.intent.value == "PROCESS_KILL"
+    assert result.dry_run is False
+    assert result.affected_pid == fake.pid
+    assert "permission denied" in result.message.lower()
+    assert "private OS details" not in result.message
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["terminate_process", "isolate_network"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("stage", ["Process", "name", "memory_info"])
+@pytest.mark.parametrize("error_type", [psutil.AccessDenied, PermissionError])
+async def test_denied_inspection_never_reports_success(
+    monkeypatch, sandbox_process, operation, dry_run, stage, error_type
+) -> None:
+    fake, run = sandbox_process
+    target = psutil if stage == "Process" else fake
+    monkeypatch.setattr(target, stage, Mock(side_effect=error_type("private OS details")))
+
+    result = await getattr(system_engine, operation)(fake.pid, dry_run=dry_run)
+
+    assert result.success is False
+    assert result.dry_run is dry_run
+    assert result.affected_pid == fake.pid
+    assert "permission denied" in result.message.lower()
+    assert "private OS details" not in result.message
+    assert fake.terminated is False
+    assert fake.killed is False
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("error_type", [psutil.AccessDenied, PermissionError])
+async def test_isolate_denied_connections_returns_failed_result(monkeypatch, sandbox_process, dry_run, error_type) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(fake, "net_connections", Mock(side_effect=error_type("private OS details")))
+
+    result = await system_engine.isolate_network(fake.pid, dry_run=dry_run)
+
+    assert result.success is False
+    assert result.intent.value == "NETWORK_ISOLATE"
+    assert result.dry_run is dry_run
+    assert "permission denied" in result.message.lower()
+    assert "private OS details" not in result.message
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error, expected_message",
+    [
+        (subprocess.CalledProcessError(1, "netsh", output=b"private OS details", stderr=b"elevation required"), "administrator"),
+        (PermissionError("private OS details"), "permission denied"),
+        (subprocess.TimeoutExpired("netsh", 5, output=b"private OS details"), "timed out"),
+        (FileNotFoundError("private OS details"), "system tools"),
+    ],
+)
+async def test_netsh_failure_never_reports_isolation_success(
+    monkeypatch, sandbox_process, error, expected_message
+) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(system_engine.sys, "platform", "win32")
+    monkeypatch.setattr(fake, "net_connections", lambda kind="inet": [SimpleNamespace(raddr=SimpleNamespace(ip="10.0.0.9"))])
+    run.side_effect = error
+
+    result = await system_engine.isolate_network(fake.pid)
+
+    assert result.success is False
+    assert result.dry_run is False
+    assert result.affected_pid == fake.pid
+    assert expected_message in result.message.lower()
+    assert "10.0.0.9" in result.message
+    assert "private OS details" not in result.message
+    assert "Isolated network access" not in result.message
+    run.assert_called_once()
+    assert run.call_args.args[0][0] == "netsh"
+    assert run.call_args.kwargs == {"check": True, "capture_output": True, "timeout": 5}
+    if isinstance(error, subprocess.TimeoutExpired):
+        assert "may have been applied" in result.message.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.CalledProcessError(1, "netsh", stderr=b"private OS details"),
+        PermissionError("private OS details"),
+        subprocess.TimeoutExpired("netsh", 5),
+    ],
+)
+async def test_isolate_partial_failure_discloses_installed_rules(monkeypatch, sandbox_process, error) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(system_engine.sys, "platform", "win32")
+    monkeypatch.setattr(
+        fake,
+        "net_connections",
+        lambda kind="inet": [
+            SimpleNamespace(raddr=SimpleNamespace(ip=ip))
+            for ip in ["10.0.0.3", "10.0.0.1", "10.0.0.2", "10.0.0.1"]
+        ],
+    )
+    run.side_effect = [subprocess.CompletedProcess(args=[], returncode=0), error]
+
+    result = await system_engine.isolate_network(fake.pid)
+
+    assert result.success is False
+    assert "partial" in result.message.lower()
+    assert "10.0.0.1" in result.message
+    assert "10.0.0.2" in result.message
+    assert "remain" in result.message.lower()
+    assert "not rolled back" in result.message.lower()
+    assert "private OS details" not in result.message
+    assert run.call_count == 2
+    assert "remoteip=10.0.0.1" in run.call_args_list[0].args[0]
+    assert "remoteip=10.0.0.2" in run.call_args_list[1].args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["terminate_process", "isolate_network"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("stage", ["Process", "name", "memory_info"])
+async def test_process_vanished_during_inspection_is_not_found(monkeypatch, sandbox_process, operation, dry_run, stage) -> None:
+    fake, run = sandbox_process
+    target = psutil if stage == "Process" else fake
+    monkeypatch.setattr(target, stage, Mock(side_effect=psutil.NoSuchProcess(fake.pid)))
+
+    with pytest.raises(ProcessNotFoundError):
+        await getattr(system_engine, operation)(fake.pid, dry_run=dry_run)
+
+    assert fake.terminated is False
+    assert fake.killed is False
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation, stage",
+    [("terminate_process", "terminate"), ("terminate_process", "wait"), ("terminate_process", "kill"), ("isolate_network", "net_connections")],
+)
+async def test_process_vanished_at_mutation_boundary_is_not_found(monkeypatch, sandbox_process, operation, stage) -> None:
+    fake, run = sandbox_process
+    if stage == "kill":
+        monkeypatch.setattr(fake, "wait", Mock(side_effect=psutil.TimeoutExpired(3, pid=fake.pid)))
+    monkeypatch.setattr(fake, stage, Mock(side_effect=psutil.NoSuchProcess(fake.pid)))
+
+    with pytest.raises(ProcessNotFoundError):
+        await getattr(system_engine, operation)(fake.pid)
+
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_final_wait_timeout_returns_failed_result(monkeypatch, sandbox_process) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(fake, "wait", Mock(side_effect=psutil.TimeoutExpired(3, pid=fake.pid)))
+
+    result = await system_engine.terminate_process(fake.pid)
+
+    assert result.success is False
+    assert "timed out" in result.message.lower()
+    assert "could not be confirmed" in result.message.lower()
+    assert fake.terminated is True
+    assert fake.killed is True
+    assert fake.wait.call_count == 2
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_timeout_fallback_succeeds_only_after_exit(monkeypatch, sandbox_process) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(fake, "wait", Mock(side_effect=[psutil.TimeoutExpired(3, pid=fake.pid), None]))
+
+    result = await system_engine.terminate_process(fake.pid)
+
+    assert result.success is True
+    assert fake.terminated is True
+    assert fake.killed is True
+    assert fake.wait.call_count == 2
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["terminate_process", "isolate_network"])
+async def test_protected_process_preview_still_raises(monkeypatch, sandbox_process, operation) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(fake, "name", lambda: "explorer.exe")
+
+    with pytest.raises(ProtectedProcessError):
+        await getattr(system_engine, operation)(fake.pid, dry_run=True)
+
+    assert fake.terminated is False
+    assert fake.killed is False
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.CalledProcessError(1, "netsh"), PermissionError("denied"), subprocess.TimeoutExpired("netsh", 5)],
+)
+def test_block_ip_propagates_firewall_failure(monkeypatch, sandbox_process, error) -> None:
+    fake, run = sandbox_process
+    monkeypatch.setattr(system_engine.sys, "platform", "win32")
+    run.side_effect = error
+
+    with pytest.raises(type(error)):
+        system_engine._block_ip("10.0.0.9")
+
+    run.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_isolate_preview_inspects_connections_without_firewall_changes(monkeypatch, sandbox_process) -> None:
+    fake, run = sandbox_process
+    connections = Mock(return_value=[SimpleNamespace(raddr=SimpleNamespace(ip="10.0.0.9"))])
+    monkeypatch.setattr(fake, "net_connections", connections)
+
+    result = await system_engine.isolate_network(fake.pid, dry_run=True)
+
+    assert result.success is True
+    assert result.dry_run is True
+    connections.assert_called_once_with(kind="inet")
+    run.assert_not_called()
