@@ -40,6 +40,22 @@ class Settings(BaseSettings):
         le=50,
         description="Number of top processes returned by inspection queries.",
     )
+    GROQ_API_KEY: SecretStr | None = Field(
+        default=None,
+        description="Optional Groq API key used to generate agentic SRE post-mortem reports.",
+    )
+    GROQ_MODEL: str = Field(
+        default="llama3-8b-8192",
+        description="Groq model name for agentic post-mortem generation.",
+    )
+    DISCORD_WEBHOOK_URL: str | None = Field(
+        default=None,
+        description="Optional Discord webhook URL for real-time incident resolution alerts.",
+    )
+    DISCORD_ALERTS_ENABLED: bool = Field(
+        default=True,
+        description="Whether to dispatch Discord webhook alerts on successful mitigations.",
+    )
 
 
 @lru_cache

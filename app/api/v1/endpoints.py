@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.core.security import confirmation_registry
 from app.schemas.command import ConfirmationRequest, ExecutionResult, IntentType
 from app.schemas.telemetry import ClusterTelemetry, SystemTelemetry, TelemetryMode
-from app.services import system_engine
+from app.services import discord_alerts, system_engine
 from app.services.incident_log import incident_log
 from app.services.system_engine import ProcessNotFoundError, ProtectedProcessError
 
@@ -85,11 +85,14 @@ async def get_cluster_state() -> ClusterTelemetry:
     response_model=ExecutionResult,
     summary="Redeem a confirmation token and execute (or dry-run) the pending mutating command",
 )
-async def confirm_command(request: ConfirmationRequest) -> ExecutionResult:
+async def confirm_command(request: ConfirmationRequest, background_tasks: BackgroundTasks) -> ExecutionResult:
     """Execute the mutating command associated with `token`, consuming it in the process.
 
     If `dry_run` is True, the pending command is evaluated and reported without mutating
     system state, and the token is *not* consumed so it may still be redeemed for real.
+
+    On successful, non-dry-run mitigation, a Discord webhook alert is dispatched
+    asynchronously in the background.
     """
     pending = confirmation_registry.peek(request.token) if request.dry_run else confirmation_registry.redeem(request.token)
     if pending is None:
@@ -128,5 +131,7 @@ async def confirm_command(request: ConfirmationRequest) -> ExecutionResult:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     if not request.dry_run:
-        incident_log.resolve_incident(request.token, result)
+        record = incident_log.resolve_incident(request.token, result)
+        if record is not None and record.success:
+            background_tasks.add_task(discord_alerts.send_resolution_alert, record)
     return result
