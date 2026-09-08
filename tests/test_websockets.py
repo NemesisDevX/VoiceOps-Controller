@@ -199,10 +199,12 @@ async def test_ready_binary_forwarding_and_stop_drains(provider):
     assert urlsplit(url).scheme == "wss"
     assert urlsplit(url).netloc == "streaming.assemblyai.com"
     assert urlsplit(url).path == "/v3/ws"
-    assert parse_qs(urlsplit(url).query) == {
+    query = parse_qs(urlsplit(url).query)
+    assert {key: query[key] for key in ("sample_rate", "encoding", "speech_model", "format_turns")} == {
         "sample_rate": ["16000"], "encoding": ["pcm_s16le"],
         "speech_model": ["universal-streaming-english"], "format_turns": ["true"],
     }
+    assert json.loads(query["keyterms_prompt"][0]) == assemblyai_client.DOMAIN_KEYTERMS
     assert set(options["additional_headers"]) == {"Authorization"}
     assert options["additional_headers"]["Authorization"] not in url
     assert 0 < options["max_queue"] <= 8

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from typing import Any
+
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
-from app.schemas.telemetry import SystemTelemetry
+from app.schemas.telemetry import ClusterTelemetry, SystemTelemetry, TelemetryMode
 from app.services import system_engine
 
 logger = logging.getLogger(__name__)
@@ -30,8 +32,8 @@ class TelemetryConnectionManager:
         async with self._lock:
             self._connections.discard(websocket)
 
-    async def broadcast(self, telemetry: SystemTelemetry) -> None:
-        payload = telemetry.model_dump(mode="json")
+    async def broadcast(self, telemetry: SystemTelemetry | dict[str, Any]) -> None:
+        payload = telemetry.model_dump(mode="json") if isinstance(telemetry, SystemTelemetry) else telemetry
         async with self._lock:
             targets = list(self._connections)
 
@@ -54,12 +56,35 @@ class TelemetryBroadcaster:
         self._top_process_limit = top_process_limit
         self.connections = TelemetryConnectionManager()
         self._task: asyncio.Task[None] | None = None
+        self._mode_lock = asyncio.Lock()
+        self._mode = TelemetryMode.HOST_LOCAL
+
+    async def get_mode(self) -> TelemetryMode:
+        """Return the currently active telemetry mode."""
+        async with self._mode_lock:
+            return self._mode
+
+    async def set_mode(self, mode: TelemetryMode) -> None:
+        """Switch which telemetry source subsequent broadcast cycles sample from."""
+        async with self._mode_lock:
+            self._mode = mode
+
+    async def _build_payload(self) -> dict[str, Any]:
+        mode = await self.get_mode()
+        if mode is TelemetryMode.K8S_CLUSTER:
+            cluster_telemetry: ClusterTelemetry = await system_engine.get_cluster_telemetry()
+            payload = cluster_telemetry.model_dump(mode="json")
+        else:
+            telemetry = await system_engine.get_system_telemetry(self._top_process_limit)
+            payload = telemetry.model_dump(mode="json")
+        payload["mode"] = mode.value
+        return payload
 
     async def _run(self) -> None:
         while True:
             try:
-                telemetry = await system_engine.get_system_telemetry(self._top_process_limit)
-                await self.connections.broadcast(telemetry)
+                payload = await self._build_payload()
+                await self.connections.broadcast(payload)
             except asyncio.CancelledError:
                 raise
             except Exception:

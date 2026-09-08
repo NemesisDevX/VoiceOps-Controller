@@ -14,9 +14,11 @@ from typing import Literal
 
 import psutil
 
+import random
+
 from app.core.security import is_protected_process
 from app.schemas.command import ExecutionResult, IntentType
-from app.schemas.telemetry import ProcessInfo, SystemTelemetry
+from app.schemas.telemetry import ClusterTelemetry, PodInfo, ProcessInfo, SystemTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -307,4 +309,212 @@ async def isolate_network(pid: int, dry_run: bool = False) -> ExecutionResult:
         dry_run=False,
         affected_pid=pid,
         affected_process_name=info.name,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Kubernetes cluster sandbox (Phase 3): a fully simulated, in-memory "cluster" used to
+# demonstrate dual-mode telemetry and mutation without touching any real infrastructure.
+# Nothing below this line reads or mutates real host state.
+# --------------------------------------------------------------------------------------
+
+
+class _SimulatedPod:
+    """Mutable in-memory state for a single simulated Kubernetes pod."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        status: str = "Running",
+        cpu_percent: float = 5.0,
+        memory_percent: float = 20.0,
+        restarts: int = 0,
+        anomaly: bool = False,
+    ) -> None:
+        self.name = name
+        self.status = status
+        self.cpu_percent = cpu_percent
+        self.memory_percent = memory_percent
+        self.restarts = restarts
+        self.anomaly = anomaly
+
+    def to_info(self) -> PodInfo:
+        return PodInfo(
+            name=self.name,
+            status=self.status,
+            cpu_percent=round(self.cpu_percent, 2),
+            memory_percent=round(self.memory_percent, 2),
+            restarts=self.restarts,
+            anomaly=self.anomaly,
+        )
+
+
+class ClusterSimulator:
+    """Owns the simulated cluster-wide metrics and per-pod state for K8S_CLUSTER mode.
+
+    A module-level singleton (`_cluster_simulator`) is used so the simulation persists
+    across calls, ticking forward slightly on every `get_cluster_telemetry` invocation
+    rather than being fully recomputed from scratch each time.
+    """
+
+    def __init__(self) -> None:
+        self.pods: dict[str, _SimulatedPod] = {
+            "payment-gateway-pod": _SimulatedPod(
+                "payment-gateway-pod",
+                status="Running",
+                cpu_percent=72.0,
+                memory_percent=88.0,
+                restarts=3,
+                anomaly=True,
+            ),
+            "auth-service-pod": _SimulatedPod(
+                "auth-service-pod",
+                status="Running",
+                cpu_percent=8.0,
+                memory_percent=22.0,
+                restarts=0,
+                anomaly=False,
+            ),
+            "redis-sentinel-pod": _SimulatedPod(
+                "redis-sentinel-pod",
+                status="Running",
+                cpu_percent=4.0,
+                memory_percent=15.0,
+                restarts=0,
+                anomaly=False,
+            ),
+        }
+        self.rps = 1100.0
+        self.p99_latency_ms = 60.0
+        self.error_rate_5xx = 0.05
+
+    def _has_active_anomaly(self) -> bool:
+        return any(pod.anomaly for pod in self.pods.values())
+
+    def tick(self) -> ClusterTelemetry:
+        """Advance the simulation by one small random-walk step and return a snapshot."""
+        anomaly_active = self._has_active_anomaly()
+
+        # Cluster-wide requests-per-second: random walk within a plausible band.
+        self.rps += random.uniform(-40.0, 40.0)
+        self.rps = max(800.0, min(1500.0, self.rps))
+
+        if anomaly_active:
+            target_latency = random.uniform(900.0, 1400.0)
+            target_error_rate = random.uniform(35.0, 45.0)
+        else:
+            target_latency = random.uniform(40.0, 90.0)
+            target_error_rate = random.uniform(0.02, 0.1)
+
+        # Nudge toward the target band rather than snapping straight to it, for a
+        # "live" feel between ticks.
+        self.p99_latency_ms += (target_latency - self.p99_latency_ms) * 0.5
+        self.error_rate_5xx += (target_error_rate - self.error_rate_5xx) * 0.5
+        self.p99_latency_ms = max(0.0, self.p99_latency_ms)
+        self.error_rate_5xx = max(0.0, min(100.0, self.error_rate_5xx))
+
+        for pod in self.pods.values():
+            if pod.name == "payment-gateway-pod" and pod.anomaly:
+                pod.cpu_percent = max(0.0, min(100.0, pod.cpu_percent + random.uniform(-2.0, 2.0)))
+                pod.memory_percent = max(0.0, min(100.0, pod.memory_percent + random.uniform(-1.5, 1.5)))
+                pod.memory_percent = max(85.0, min(95.0, pod.memory_percent))
+            else:
+                pod.cpu_percent = max(0.0, min(100.0, pod.cpu_percent + random.uniform(-1.0, 1.0)))
+                pod.memory_percent = max(0.0, min(100.0, pod.memory_percent + random.uniform(-1.0, 1.0)))
+
+        return ClusterTelemetry(
+            rps=round(self.rps, 2),
+            p99_latency_ms=round(self.p99_latency_ms, 2),
+            error_rate_5xx=round(self.error_rate_5xx, 3),
+            pods=[pod.to_info() for pod in self.pods.values()],
+        )
+
+    def recover_pod(self, pod_name: str) -> None:
+        """Immediately clear a pod's anomaly and normalize cluster-wide metrics."""
+        pod = self.pods[pod_name]
+        pod.anomaly = False
+        pod.status = "Running"
+        pod.cpu_percent = min(pod.cpu_percent, 15.0)
+        pod.memory_percent = min(pod.memory_percent, 25.0)
+        # Immediate metric recovery: snap cluster-wide indicators back to healthy values
+        # rather than waiting for subsequent ticks to converge.
+        self.error_rate_5xx = 0.05
+        self.p99_latency_ms = 65.0
+        self.rps = max(800.0, min(1500.0, self.rps))
+
+
+_cluster_simulator = ClusterSimulator()
+
+
+async def get_cluster_telemetry() -> ClusterTelemetry:
+    """Advance the simulated cluster one tick and return a snapshot.
+
+    Pure Python/random arithmetic; cheap and non-blocking, so it is safe to call once per
+    second from the telemetry broadcaster. Declared `async def` for interface parity with
+    `get_system_telemetry`, even though no actual I/O or thread offload is required.
+    """
+    return _cluster_simulator.tick()
+
+
+async def cluster_execute(intent: IntentType, target_name: str, dry_run: bool = False) -> ExecutionResult:
+    """Simulate a mutating action (`PROCESS_KILL`, `NETWORK_ISOLATE`, or `ROLLBACK`) against
+    a named pod in the simulated Kubernetes cluster.
+
+    Raises `ProcessNotFoundError` if `target_name` does not match a pod in the simulator,
+    mirroring the host-mode error handling contract so callers can catch uniformly.
+    """
+    if not target_name or target_name not in _cluster_simulator.pods:
+        raise ProcessNotFoundError(f"Pod '{target_name}' was not found in the simulated cluster.")
+
+    pod = _cluster_simulator.pods[target_name]
+
+    if intent is IntentType.PROCESS_KILL:
+        action_preview = "restart"
+        action_done = "Restarted"
+    elif intent is IntentType.NETWORK_ISOLATE:
+        action_preview = "network-isolate"
+        action_done = "Isolated network access for"
+    elif intent is IntentType.ROLLBACK:
+        action_preview = "roll back the deployment for"
+        action_done = "Rolled back the deployment for"
+    else:
+        return ExecutionResult(
+            success=False,
+            intent=intent,
+            message=f"Intent {intent} is not a supported cluster mutation.",
+            dry_run=dry_run,
+            affected_process_name=target_name,
+        )
+
+    if dry_run:
+        return ExecutionResult(
+            success=True,
+            intent=intent,
+            message=f"[DRY RUN] Would {action_preview} pod '{pod.name}'. Execution permissions are not verified.",
+            dry_run=True,
+            affected_process_name=pod.name,
+        )
+
+    was_anomalous = pod.anomaly
+    if intent is IntentType.PROCESS_KILL:
+        pod.restarts += 1
+        if was_anomalous and pod.name == "payment-gateway-pod":
+            _cluster_simulator.recover_pod(pod.name)
+    elif intent is IntentType.ROLLBACK:
+        if was_anomalous and pod.name == "payment-gateway-pod":
+            _cluster_simulator.recover_pod(pod.name)
+        pod.restarts += 1
+    # NETWORK_ISOLATE does not, on its own, clear an anomaly in this sandbox.
+
+    recovery_note = ""
+    if was_anomalous and pod.name == "payment-gateway-pod" and not pod.anomaly:
+        recovery_note = " Anomaly cleared; metrics have recovered."
+
+    return ExecutionResult(
+        success=True,
+        intent=intent,
+        message=f"{action_done} pod '{pod.name}'.{recovery_note}",
+        dry_run=False,
+        affected_process_name=pod.name,
     )

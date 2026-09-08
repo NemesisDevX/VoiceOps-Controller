@@ -12,6 +12,7 @@ os.environ.setdefault("ASSEMBLYAI_API_KEY", "test-key-not-real")
 from app.core.security import confirmation_registry
 from app.main import create_app
 from app.schemas.telemetry import ProcessInfo
+from app.services.incident_log import incident_log
 
 
 @pytest.fixture
@@ -30,6 +31,15 @@ def _clear_confirmation_registry():
     yield
     with confirmation_registry._lock:
         confirmation_registry._pending.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_incident_log():
+    """Ensure incident records never leak between tests."""
+    yield
+    with incident_log._lock:
+        incident_log._records.clear()
+        incident_log._order.clear()
 
 
 @pytest.fixture

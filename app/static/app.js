@@ -295,10 +295,65 @@ class MicrophoneUplink {
     }
 }
 
+const SPEECH_LOCALES = { en: "en-US", ar: "ar-SA", es: "es-ES", fr: "fr-FR", zh: "zh-CN" };
+const SRE_ACKNOWLEDGEMENTS = {
+    isolate: {
+        en: "Incident resolved. Target isolated. Metrics stabilized.",
+        ar: "تم حل الحادثة. تم عزل الهدف. استقرت المقاييس.",
+        es: "Incidente resuelto. Objetivo aislado. Métricas estabilizadas.",
+        fr: "Incident résolu. Cible isolée. Métriques stabilisées.",
+        zh: "事件已解决。目标已隔离。指标已稳定。",
+    },
+    terminate: {
+        en: "Incident resolved. Target terminated. Metrics stabilized.",
+        ar: "تم حل الحادثة. تم إنهاء الهدف. استقرت المقاييس.",
+        es: "Incidente resuelto. Objetivo terminado. Métricas estabilizadas.",
+        fr: "Incident résolu. Cible arrêtée. Métriques stabilisées.",
+        zh: "事件已解决。目标已终止。指标已稳定。",
+    },
+    rollback: {
+        en: "Incident resolved. Deployment rolled back. Metrics stabilized.",
+        ar: "تم حل الحادثة. تم التراجع عن النشر. استقرت المقاييس.",
+        es: "Incidente resuelto. Despliegue revertido. Métricas estabilizadas.",
+        fr: "Incident résolu. Déploiement annulé. Métriques stabilisées.",
+        zh: "事件已解决。部署已回滚。指标已稳定。",
+    },
+    gate: {
+        en: "Confirmation required before execution.",
+        ar: "التأكيد مطلوب قبل التنفيذ.",
+        es: "Se requiere confirmación antes de la ejecución.",
+        fr: "Confirmation requise avant l'exécution.",
+        zh: "执行前需要确认。",
+    },
+    failed: {
+        en: "Remediation failed. Manual review required.",
+        ar: "فشلت المعالجة. يلزم مراجعة يدوية.",
+        es: "La remediación falló. Se requiere revisión manual.",
+        fr: "La remédiation a échoué. Une révision manuelle est requise.",
+        zh: "补救失败。需要人工审查。",
+    },
+};
+
+function speak(kind, language = "en") {
+    if (!globalThis.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return;
+    const phrase = (SRE_ACKNOWLEDGEMENTS[kind] ?? SRE_ACKNOWLEDGEMENTS.gate)[language] ?? SRE_ACKNOWLEDGEMENTS[kind]?.en ?? "";
+    if (!phrase) return;
+    try {
+        const utterance = new SpeechSynthesisUtterance(phrase);
+        utterance.lang = SPEECH_LOCALES[language] ?? "en-US";
+        utterance.rate = 1.02;
+        speechSynthesis.cancel();
+        speechSynthesis.speak(utterance);
+    } catch {
+        /* Speech synthesis is a best-effort acknowledgement; never block on failure. */
+    }
+}
+
 function bootDashboard() {
     const $ = id => document.getElementById(id);
-    const histories = { cpu: [], memory: [], disk: [] };
+    const histories = { primary: [], secondary: [], tertiary: [] };
     let telemetry = null;
+    let telemetryMode = "HOST_LOCAL";
     let lastSample = 0;
     let packetCount = 0;
     let ranking = "memory";
@@ -309,6 +364,38 @@ function bootDashboard() {
     const dialog = $("confirmation-dialog");
     const feed = $("terminal-feed");
     const formatTime = () => new Date().toISOString().slice(11, 19);
+
+    function applyModeChrome(mode) {
+        telemetryMode = mode;
+        const cluster = mode === "K8S_CLUSTER";
+        $("mode-host").setAttribute("aria-pressed", String(!cluster));
+        $("mode-cluster").setAttribute("aria-pressed", String(cluster));
+        $("rank-toggle").hidden = cluster;
+        $("processes-title-text").textContent = cluster ? "Pod monitor" : "Process monitor";
+        $("processes-caption").textContent = cluster
+            ? "Simulated Kubernetes pods in the current cluster sandbox"
+            : "Highest resource-consuming processes on this host";
+        const columns = cluster
+            ? ["NAME", "STATUS", "CPU %", "MEM %", "RESTARTS"]
+            : ["PID", "PROCESS NAME", "CPU %", "RAM %", "RSS / MB"];
+        columns.forEach((label, index) => { $(`col-${index + 1}`).textContent = label; });
+        const cards = cluster
+            ? [["cpu", "CLUSTER RPS", "", "Requests per second across all pods"], ["memory", "P99 LATENCY", "ms", "99th-percentile request latency"], ["disk", "5XX ERROR RATE", "%", "Percentage of requests failing with a 5xx"]]
+            : [["cpu", "CPU UTILIZATION", "%", "System-wide processor load"], ["memory", "MEMORY USAGE", "%", "Physical memory allocation"], ["disk", "DISK CAPACITY", "%", "Root volume space consumed"]];
+        for (const [id, label, unit, caption] of cards) {
+            $(`${id}-label`).textContent = label;
+            $(`${id}-unit`).textContent = unit;
+            $(`${id}-caption`).textContent = caption;
+            $(`${id}-gauge`).max = cluster && id !== "disk" ? 100000 : 100;
+        }
+        $("sockets-label").textContent = cluster ? "ANOMALOUS PODS" : "ACTIVE SOCKETS";
+        $("sockets-unit").textContent = cluster ? "PODS" : "CONN";
+        $("sockets-caption").textContent = cluster ? "Pods currently in a degraded/incident state" : "Best effort; OS permissions apply";
+        histories.primary = [];
+        histories.secondary = [];
+        histories.tertiary = [];
+        renderProcesses();
+    }
 
     function log(kind, label, text) {
         const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
@@ -326,7 +413,32 @@ function bootDashboard() {
         if (atBottom) feed.scrollTop = feed.scrollHeight;
     }
 
+    function renderClusterPods() {
+        const pods = telemetry?.pods;
+        if (!Array.isArray(pods)) return;
+        const body = $("process-rows");
+        body.replaceChildren();
+        for (const pod of pods) {
+            const row = document.createElement("tr");
+            row.dataset.anomaly = String(Boolean(pod.anomaly));
+            const values = [pod.name, pod.status, Number(pod.cpu_percent).toFixed(1), Number(pod.memory_percent).toFixed(1), pod.restarts];
+            values.forEach((value, index) => {
+                const cell = document.createElement("td");
+                cell.textContent = value;
+                if (index > 1) cell.className = "numeric";
+                if (index === 0) cell.title = String(value);
+                row.append(cell);
+            });
+            body.append(row);
+        }
+        $("process-count").textContent = `${pods.length} PODS`;
+    }
+
     function renderProcesses() {
+        if (telemetryMode === "K8S_CLUSTER") {
+            renderClusterPods();
+            return;
+        }
         const rows = telemetry?.[ranking === "cpu" ? "top_cpu_processes" : "top_memory_processes"];
         if (!Array.isArray(rows)) return;
         const body = $("process-rows");
@@ -356,22 +468,60 @@ function bootDashboard() {
         $("process-count").textContent = `${Math.min(rows.length, 50)} PROCESSES`;
     }
 
-    function updateTelemetry(data) {
-        if (![data.cpu_percent, data.memory_percent, data.disk_percent, data.active_sockets].every(Number.isFinite)) throw new Error("Invalid telemetry");
-        telemetry = data;
-        lastSample = Date.now();
-        packetCount++;
-        for (const metric of ["cpu", "memory", "disk"]) {
-            const value = Math.max(0, Math.min(100, data[`${metric}_percent`]));
-            $(`${metric}-value`).textContent = value.toFixed(1);
-            $(`${metric}-gauge`).value = value;
-            $(`${metric}-card`).dataset.severity = value >= 90 ? "critical" : value >= 75 ? "warning" : "normal";
-            const history = histories[metric];
-            history.push(value);
-            if (history.length > 30) history.shift();
-            $(`${metric}-spark`).setAttribute("points", history.map((point, index) => `${index * 120 / 29},${38 - point * 0.35}`).join(" "));
+    function updateHostTelemetry(data) {
+        for (const [id, key] of [["cpu", "cpu_percent"], ["memory", "memory_percent"], ["disk", "disk_percent"]]) {
+            const value = Math.max(0, Math.min(100, data[key]));
+            $(`${id}-value`).textContent = value.toFixed(1);
+            $(`${id}-gauge`).value = value;
+            $(`${id}-card`).dataset.severity = value >= 90 ? "critical" : value >= 75 ? "warning" : "normal";
         }
         $("sockets-value").textContent = data.active_sockets.toLocaleString();
+        pushSparks([data.cpu_percent, data.memory_percent, data.disk_percent]);
+    }
+
+    function updateClusterTelemetry(data) {
+        const anomalies = data.pods.filter(pod => pod.anomaly).length;
+        $("cpu-value").textContent = data.rps.toFixed(0);
+        $("cpu-gauge").value = Math.min(data.rps, 100000);
+        $("cpu-card").dataset.severity = "normal";
+        $("memory-value").textContent = data.p99_latency_ms.toFixed(0);
+        $("memory-gauge").value = Math.min(data.p99_latency_ms, 100000);
+        $("memory-card").dataset.severity = data.p99_latency_ms >= 500 ? "critical" : data.p99_latency_ms >= 150 ? "warning" : "normal";
+        $("disk-value").textContent = data.error_rate_5xx.toFixed(2);
+        $("disk-gauge").value = Math.min(data.error_rate_5xx, 100);
+        $("disk-card").dataset.severity = data.error_rate_5xx >= 10 ? "critical" : data.error_rate_5xx >= 1 ? "warning" : "normal";
+        $("sockets-value").textContent = String(anomalies);
+        pushSparks([data.rps / 1000, data.p99_latency_ms / 10, data.error_rate_5xx]);
+    }
+
+    function pushSparks(values) {
+        for (const [index, key] of ["primary", "secondary", "tertiary"].entries()) {
+            const history = histories[key];
+            history.push(Math.max(0, Math.min(100, values[index])));
+            if (history.length > 30) history.shift();
+        }
+        const ids = ["cpu-spark", "memory-spark", "disk-spark"];
+        const keys = ["primary", "secondary", "tertiary"];
+        ids.forEach((id, index) => {
+            const history = histories[keys[index]];
+            $(id).setAttribute("points", history.map((point, i) => `${i * 120 / 29},${38 - point * 0.35}`).join(" "));
+        });
+    }
+
+    function updateTelemetry(data) {
+        const mode = data.mode === "K8S_CLUSTER" ? "K8S_CLUSTER" : "HOST_LOCAL";
+        if (mode !== telemetryMode) applyModeChrome(mode);
+        if (mode === "K8S_CLUSTER") {
+            if (!Array.isArray(data.pods) || ![data.rps, data.p99_latency_ms, data.error_rate_5xx].every(Number.isFinite)) throw new Error("Invalid cluster telemetry");
+            telemetry = data;
+            updateClusterTelemetry(data);
+        } else {
+            if (![data.cpu_percent, data.memory_percent, data.disk_percent, data.active_sockets].every(Number.isFinite)) throw new Error("Invalid telemetry");
+            telemetry = data;
+            updateHostTelemetry(data);
+        }
+        lastSample = Date.now();
+        packetCount++;
         $("packet-count").textContent = `${packetCount.toLocaleString()} PACKETS RECEIVED`;
         $("connection-notice").hidden = true;
         $("telemetry-status").dataset.state = "live";
@@ -379,6 +529,26 @@ function bootDashboard() {
         telemetrySocket.markHealthy(6000);
         renderProcesses();
     }
+
+    async function setTelemetryMode(mode) {
+        try {
+            const response = await fetch("/api/v1/telemetry/mode", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ mode }), credentials: "same-origin", signal: AbortSignal.timeout(10000),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const result = await response.json();
+            applyModeChrome(result.mode);
+            log("system", "MODE", `Telemetry mode switched to ${result.mode}.`);
+        } catch (error) {
+            log("error", "MODE", `Failed to switch telemetry mode: ${error.message}`);
+        }
+    }
+
+    fetch("/api/v1/telemetry/mode", { credentials: "same-origin" })
+        .then(response => (response.ok ? response.json() : null))
+        .then(result => { if (result?.mode) applyModeChrome(result.mode); })
+        .catch(() => {});
 
     const telemetrySocket = new ReconnectingSocket("/ws/telemetry", {
         onMessage: updateTelemetry,
@@ -409,7 +579,7 @@ function bootDashboard() {
     }
 
     function showConfirmation(message) {
-        if (!message.token || !Number.isFinite(Date.parse(message.expires_at)) || message.preview?.success !== true || !["PROCESS_KILL", "NETWORK_ISOLATE"].includes(message.intent)) {
+        if (!message.token || !Number.isFinite(Date.parse(message.expires_at)) || message.preview?.success !== true || !["PROCESS_KILL", "NETWORK_ISOLATE", "ROLLBACK"].includes(message.intent)) {
             log("error", "GATE", "Rejected an invalid confirmation payload.");
             return;
         }
@@ -421,14 +591,20 @@ function bootDashboard() {
         consumed = false;
         invalidated = false;
         $("confirmation-intent").textContent = message.intent;
-        $("confirmation-target").textContent = `${message.preview.affected_process_name ?? "process"} / PID ${message.preview.affected_pid ?? "unknown"}`;
+        const target = message.preview.affected_process_name ?? "process";
+        $("confirmation-target").textContent = message.mode === "K8S_CLUSTER" ? `${target} (simulated pod)` : `${target} / PID ${message.preview.affected_pid ?? "unknown"}`;
         $("confirmation-summary").textContent = message.preview.message;
-        $("confirmation-warning").textContent = message.intent === "NETWORK_ISOLATE" ? "Scope warning: existing isolation blocks remote IPs host-wide, affecting other applications too. It is not a per-process sandbox. Firewall changes may need administrator privileges and manual removal." : "This terminates the target process and may discard unsaved work. The server rechecks its protected-process policy before execution.";
+        $("confirmation-warning").textContent = message.intent === "NETWORK_ISOLATE"
+            ? "Scope warning: existing isolation blocks remote IPs host-wide, affecting other applications too. It is not a per-process sandbox. Firewall changes may need administrator privileges and manual removal."
+            : message.intent === "ROLLBACK"
+                ? "This is a simulated Kubernetes sandbox rollback; it does not affect any real deployment."
+                : "This terminates the target process and may discard unsaved work. The server rechecks its protected-process policy before execution.";
         $("confirmation-feedback").textContent = "Review the exact target. Voice keywords do not confirm execution.";
         syncConfirmation();
         dialog.showModal();
         $("cancel-confirmation").focus();
         log("gate", "GATE", `${message.intent} queued for operator review. No action executed.`);
+        speak("gate", message.language);
     }
 
     async function confirm(dryRun) {
@@ -452,6 +628,12 @@ function bootDashboard() {
             log(response.ok && result.success ? "result" : "error", dryRun ? "DRY RUN" : "RESULT", $("confirmation-feedback").textContent);
             if (dryRun && response.ok && result.success) $("confirmation-summary").textContent = result.message;
             if (dryRun && (!response.ok || result.success !== true)) invalidated = true;
+            if (!dryRun) {
+                const kind = response.ok && result.success
+                    ? request.intent === "ROLLBACK" ? "rollback" : request.intent === "NETWORK_ISOLATE" ? "isolate" : "terminate"
+                    : "failed";
+                speak(kind, request.language);
+            }
         } catch {
             const message = dryRun ? "Dry-run request could not be completed. No execution was requested." : "Execution outcome unknown: the request or response was interrupted. Verify the host before issuing another command. This action will not be retried automatically.";
             $("confirmation-feedback").textContent = message;
@@ -496,6 +678,30 @@ function bootDashboard() {
 
     $("mic-toggle").addEventListener("click", () => uplink.wanted ? uplink.stop() : void uplink.start());
     $("clear-feed").addEventListener("click", () => { feed.replaceChildren(); log("system", "SYS", "Local display cleared. Server-side state is unchanged."); });
+    $("mode-host").addEventListener("click", () => void setTelemetryMode("HOST_LOCAL"));
+    $("mode-cluster").addEventListener("click", () => void setTelemetryMode("K8S_CLUSTER"));
+    $("export-post-mortem").addEventListener("click", async () => {
+        const button = $("export-post-mortem");
+        button.disabled = true;
+        try {
+            const response = await fetch("/api/v1/incident/post-mortem?format=markdown", { credentials: "same-origin", signal: AbortSignal.timeout(10000) });
+            if (!response.ok) throw new Error(response.status === 404 ? "No resolved incident is available to export yet." : `HTTP ${response.status}`);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "voiceops-post-mortem.md";
+            document.body.append(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+            log("system", "EXPORT", "Post-mortem exported.");
+        } catch (error) {
+            log("error", "EXPORT", error.message);
+        } finally {
+            button.disabled = false;
+        }
+    });
     for (const metric of ["memory", "cpu"]) $("rank-" + metric).addEventListener("click", () => {
         ranking = metric;
         for (const name of ["memory", "cpu"]) $("rank-" + name).setAttribute("aria-pressed", String(name === metric));

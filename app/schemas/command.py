@@ -16,6 +16,7 @@ class IntentType(str, Enum):
     INSPECT = "INSPECT"
     PROCESS_KILL = "PROCESS_KILL"
     NETWORK_ISOLATE = "NETWORK_ISOLATE"
+    ROLLBACK = "ROLLBACK"
     UNKNOWN = "UNKNOWN"
 
 
@@ -49,6 +50,7 @@ class ParsedCommand(BaseModel):
         default=False, description="True if this is a mutating command gated behind a confirmation token."
     )
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Parser confidence in the resolved intent.")
+    language: str = Field(default="en", description="ISO 639-1 code of the language the command was matched in.")
 
 
 class PendingConfirmation(BaseModel):
@@ -58,6 +60,7 @@ class PendingConfirmation(BaseModel):
     command: ParsedCommand = Field(..., description="The mutating command awaiting confirmation.")
     created_at: datetime = Field(..., description="UTC timestamp the confirmation was registered.")
     expires_at: datetime = Field(..., description="UTC timestamp after which the token is no longer valid.")
+    mode: str = Field(default="HOST_LOCAL", description="Telemetry mode active when this confirmation was registered.")
 
 
 class ConfirmationRequest(BaseModel):

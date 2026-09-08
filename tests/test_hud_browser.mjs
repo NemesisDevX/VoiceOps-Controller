@@ -192,6 +192,21 @@ test("native HUD browser integration (local server required; all mutations and S
             assert.ok(await evaluate("document.documentElement.scrollWidth <= innerWidth"));
             await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
         });
+        await t.test("K8S_CLUSTER mode toggle swaps HUD chrome and renders simulated pods", async () => {
+            await evaluate("document.getElementById('mode-cluster').click()");
+            await until("document.getElementById('mode-cluster').getAttribute('aria-pressed') === 'true'");
+            await until("document.getElementById('processes-title-text').textContent === 'Pod monitor'");
+            await until("document.querySelectorAll('#process-rows tr').length === 3");
+            assert.equal(await evaluate("document.getElementById('col-1').textContent"), "NAME");
+            assert.ok(await evaluate("[...document.querySelectorAll('#process-rows td')].some(cell => cell.textContent === 'payment-gateway-pod')"));
+            assert.equal(await evaluate("document.getElementById('rank-toggle').hidden"), true);
+            await evaluate("document.getElementById('mode-host').click()");
+            await until("document.getElementById('processes-title-text').textContent === 'Process monitor'");
+        });
+        await t.test("export post-mortem button exists and reports a clear error with no resolved incident", async () => {
+            await evaluate("document.getElementById('export-post-mortem').click()");
+            await until("document.getElementById('terminal-feed').textContent.includes('No resolved incident')");
+        });
         assert.deepEqual(exceptions, []);
         if (process.env.VOICEOPS_SCREENSHOT) {
             const { data } = await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true });

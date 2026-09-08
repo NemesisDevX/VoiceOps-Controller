@@ -164,3 +164,136 @@ def test_confirm_rejects_non_mutating_pending_command(client: TestClient) -> Non
     response = client.post("/api/v1/commands/confirm", json={"token": "inspect-token"})
 
     assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------------------
+# Phase 3: dual-mode telemetry (HOST_LOCAL / K8S_CLUSTER) and cluster sandbox endpoints.
+# --------------------------------------------------------------------------------------
+
+
+def test_get_telemetry_mode_defaults_to_host_local(client: TestClient) -> None:
+    response = client.get("/api/v1/telemetry/mode")
+
+    assert response.status_code == 200
+    assert response.json() == {"mode": "HOST_LOCAL"}
+
+
+def test_set_telemetry_mode_switches_mode(client: TestClient) -> None:
+    response = client.post("/api/v1/telemetry/mode", json={"mode": "K8S_CLUSTER"})
+
+    assert response.status_code == 200
+    assert response.json() == {"mode": "K8S_CLUSTER"}
+
+    follow_up = client.get("/api/v1/telemetry/mode")
+    assert follow_up.json() == {"mode": "K8S_CLUSTER"}
+
+    # Reset for subsequent tests since the app instance is fresh per-test via the `client` fixture,
+    # but be explicit for clarity/robustness regardless of fixture scope.
+    client.post("/api/v1/telemetry/mode", json={"mode": "HOST_LOCAL"})
+
+
+def test_set_telemetry_mode_rejects_invalid_mode(client: TestClient) -> None:
+    response = client.post("/api/v1/telemetry/mode", json={"mode": "NOT_A_REAL_MODE"})
+
+    assert response.status_code == 422
+
+
+def test_cluster_state_endpoint_returns_telemetry_shape(client: TestClient) -> None:
+    response = client.get("/api/v1/cluster/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(["rps", "p99_latency_ms", "error_rate_5xx", "pods", "timestamp"]).issubset(body.keys())
+    pod_names = {pod["name"] for pod in body["pods"]}
+    assert pod_names == {"payment-gateway-pod", "auth-service-pod", "redis-sentinel-pod"}
+
+
+def test_confirm_routes_to_cluster_execute_when_mode_is_k8s_cluster(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = ParsedCommand(
+        raw_text="restart the payment gateway pod",
+        intent=IntentType.PROCESS_KILL,
+        target_process_name="payment-gateway-pod",
+        requires_confirmation=True,
+    )
+    now = datetime.now(timezone.utc)
+    pending = PendingConfirmation(
+        token="cluster-token-1",
+        command=command,
+        created_at=now,
+        expires_at=now + timedelta(seconds=60),
+        mode="K8S_CLUSTER",
+    )
+    confirmation_registry._pending[pending.token] = pending
+
+    captured: dict = {}
+
+    async def fake_cluster_execute(intent, target_name, dry_run=False):
+        captured["intent"] = intent
+        captured["target_name"] = target_name
+        captured["dry_run"] = dry_run
+        return ExecutionResult(
+            success=True,
+            intent=intent,
+            message="Restarted pod.",
+            dry_run=dry_run,
+            affected_process_name=target_name,
+        )
+
+    monkeypatch.setattr(system_engine, "cluster_execute", fake_cluster_execute)
+
+    response = client.post("/api/v1/commands/confirm", json={"token": "cluster-token-1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["affected_process_name"] == "payment-gateway-pod"
+    assert captured["intent"] == IntentType.PROCESS_KILL
+    assert captured["target_name"] == "payment-gateway-pod"
+    assert captured["dry_run"] is False
+
+
+def test_confirm_rollback_in_host_local_mode_returns_400(client: TestClient) -> None:
+    command = ParsedCommand(
+        raw_text="roll back the deployment",
+        intent=IntentType.ROLLBACK,
+        target_process_name="payment-gateway-pod",
+        requires_confirmation=True,
+    )
+    now = datetime.now(timezone.utc)
+    pending = PendingConfirmation(
+        token="rollback-host-token",
+        command=command,
+        created_at=now,
+        expires_at=now + timedelta(seconds=60),
+        mode="HOST_LOCAL",
+    )
+    confirmation_registry._pending[pending.token] = pending
+
+    response = client.post("/api/v1/commands/confirm", json={"token": "rollback-host-token"})
+
+    assert response.status_code == 400
+    assert "K8S_CLUSTER" in response.json()["detail"]
+
+
+def test_confirm_cluster_execute_unknown_pod_returns_404(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    command = ParsedCommand(
+        raw_text="kill the ghost pod",
+        intent=IntentType.PROCESS_KILL,
+        target_process_name="ghost-pod",
+        requires_confirmation=True,
+    )
+    now = datetime.now(timezone.utc)
+    pending = PendingConfirmation(
+        token="cluster-token-404",
+        command=command,
+        created_at=now,
+        expires_at=now + timedelta(seconds=60),
+        mode="K8S_CLUSTER",
+    )
+    confirmation_registry._pending[pending.token] = pending
+
+    response = client.post("/api/v1/commands/confirm", json={"token": "cluster-token-404"})
+
+    assert response.status_code == 404

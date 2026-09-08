@@ -12,10 +12,14 @@ from starlette.websockets import WebSocketState
 from app.core.config import get_settings
 from app.core.security import confirmation_registry
 from app.schemas.command import IntentType, ParsedCommand
+from app.schemas.telemetry import TelemetryMode
 from app.services import system_engine
 from app.services.assemblyai_client import AssemblyAIStreamingError, AssemblyAIStreamingSession
+from app.services.incident_log import incident_log
 from app.services.intent_parser import IntentParser
 from app.services.system_engine import ProcessNotFoundError, ProtectedProcessError
+
+MUTATING_INTENTS = frozenset({IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE, IntentType.ROLLBACK})
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +131,9 @@ async def voice_stream(websocket: WebSocket) -> None:
             return
         await sender.send_json({"type": "transcript", "text": transcript, "end_of_turn": end_of_turn})
         if end_of_turn:
-            await _handle_command(sender, parser, transcript)
+            broadcaster = getattr(websocket.app.state, "telemetry_broadcaster", None)
+            mode = await broadcaster.get_mode() if broadcaster is not None else TelemetryMode.HOST_LOCAL
+            await _handle_command(sender, parser, transcript, mode)
 
     async def on_error(message: str, retryable: bool) -> None:
         nonlocal provider_error
@@ -244,24 +250,33 @@ async def voice_stream(websocket: WebSocket) -> None:
             pass
 
 
-async def _handle_command(websocket: WebSocket | _LockedSender, parser: IntentParser, transcript: str) -> None:
+async def _handle_command(
+    websocket: WebSocket | _LockedSender, parser: IntentParser, transcript: str,
+    mode: TelemetryMode = TelemetryMode.HOST_LOCAL,
+) -> None:
     """Parse a finalized transcript and act on it: execute INSPECT queries, gate mutations."""
     command = parser.parse(transcript)
 
     if command.intent is IntentType.INSPECT:
-        await _execute_inspection(websocket, parser, command)
+        await _execute_inspection(websocket, parser, command, mode)
         return
 
-    if command.intent in (IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE):
-        await _gate_mutation(websocket, command)
+    if command.intent in MUTATING_INTENTS:
+        await _gate_mutation(websocket, command, mode)
         return
 
     await websocket.send_json(
-        {"type": "command_result", "success": False, "intent": IntentType.UNKNOWN.value, "message": f"Could not understand command: '{transcript}'."}
+        {
+            "type": "command_result", "success": False, "intent": IntentType.UNKNOWN.value,
+            "language": command.language, "message": f"Could not understand command: '{transcript}'.",
+        }
     )
 
 
-async def _execute_inspection(websocket: WebSocket | _LockedSender, parser: IntentParser, command: ParsedCommand) -> None:
+async def _execute_inspection(
+    websocket: WebSocket | _LockedSender, parser: IntentParser, command: ParsedCommand,
+    mode: TelemetryMode = TelemetryMode.HOST_LOCAL,
+) -> None:
     settings = get_settings()
     ranking = _INSPECTION_TARGET_TO_RANKING.get(
         command.inspection_target.value if command.inspection_target else "", "memory"
@@ -274,50 +289,73 @@ async def _execute_inspection(websocket: WebSocket | _LockedSender, parser: Inte
             "type": "command_result",
             "success": True,
             "intent": IntentType.INSPECT.value,
+            "language": command.language,
+            "mode": mode.value,
             "message": f"Top {len(processes)} processes by {ranking}.",
             "processes": [p.model_dump(mode="json") for p in processes],
         }
     )
 
 
-async def _gate_mutation(websocket: WebSocket | _LockedSender, command: ParsedCommand) -> None:
-    if command.target_pid is None:
+async def _gate_mutation(
+    websocket: WebSocket | _LockedSender, command: ParsedCommand, mode: TelemetryMode = TelemetryMode.HOST_LOCAL
+) -> None:
+    cluster_mode = mode is TelemetryMode.K8S_CLUSTER
+    target_label = command.target_process_name if cluster_mode else command.target_pid
+
+    if cluster_mode and command.intent is IntentType.ROLLBACK and not command.target_process_name:
+        target_label = None
+    elif not cluster_mode and command.intent is IntentType.ROLLBACK:
+        await websocket.send_json(
+            {
+                "type": "command_result", "success": False, "intent": command.intent.value,
+                "language": command.language, "message": "ROLLBACK is only available in K8S_CLUSTER telemetry mode.",
+            }
+        )
+        return
+
+    if target_label is None:
         await websocket.send_json(
             {
                 "type": "command_result",
                 "success": False,
                 "intent": command.intent.value,
+                "language": command.language,
                 "message": "No target process could be identified for this command.",
             }
         )
         return
 
     try:
-        preview = (
-            await system_engine.terminate_process(command.target_pid, dry_run=True)
-            if command.intent is IntentType.PROCESS_KILL
-            else await system_engine.isolate_network(command.target_pid, dry_run=True)
-        )
+        if cluster_mode:
+            preview = await system_engine.cluster_execute(command.intent, command.target_process_name, dry_run=True)
+        elif command.intent is IntentType.PROCESS_KILL:
+            preview = await system_engine.terminate_process(command.target_pid, dry_run=True)
+        else:
+            preview = await system_engine.isolate_network(command.target_pid, dry_run=True)
     except ProtectedProcessError as exc:
         await websocket.send_json(
-            {"type": "command_result", "success": False, "intent": command.intent.value, "message": str(exc)}
+            {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
         )
         return
     except ProcessNotFoundError as exc:
         await websocket.send_json(
-            {"type": "command_result", "success": False, "intent": command.intent.value, "message": str(exc)}
+            {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
         )
         return
 
     if not preview.success:
-        await websocket.send_json({"type": "command_result", **preview.model_dump(mode="json")})
+        await websocket.send_json({"type": "command_result", "language": command.language, **preview.model_dump(mode="json")})
         return
 
-    pending = confirmation_registry.register(command)
+    pending = confirmation_registry.register(command, mode=mode.value)
+    incident_log.open_incident(pending.token, command, mode.value)
     await websocket.send_json(
         {
             "type": "confirmation_required",
             "intent": command.intent.value,
+            "language": command.language,
+            "mode": mode.value,
             "token": pending.token,
             "expires_at": pending.expires_at.isoformat(),
             "preview": preview.model_dump(mode="json"),

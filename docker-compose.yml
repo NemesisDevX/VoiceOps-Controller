@@ -1,0 +1,18 @@
+# Local/production-like single-service compose file for VoiceOps Controller.
+#
+# Before running `docker compose up --build`, create a `.env` file in this directory
+# from `.env.example` and set your real ASSEMBLYAI_API_KEY (and any other overrides).
+# Do NOT commit `.env` or bake real secrets into this file or the image — it is
+# injected at container start via `env_file` below.
+services:
+  voiceops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voiceops-controller:latest
+    container_name: voiceops-controller
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped

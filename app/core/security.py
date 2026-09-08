@@ -30,7 +30,7 @@ PROTECTED_PROCESS_NAMES: frozenset[str] = frozenset(
     }
 )
 
-MUTATING_INTENTS: frozenset[IntentType] = frozenset({IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE})
+MUTATING_INTENTS: frozenset[IntentType] = frozenset({IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE, IntentType.ROLLBACK})
 
 
 def is_protected_process(name: str) -> bool:
@@ -60,14 +60,20 @@ class ConfirmationRegistry:
         self._lock = threading.Lock()
         self._pending: dict[str, PendingConfirmation] = {}
 
-    def register(self, command: ParsedCommand) -> PendingConfirmation:
-        """Create and store a new pending confirmation for a mutating `ParsedCommand`."""
+    def register(self, command: ParsedCommand, mode: str = "HOST_LOCAL") -> PendingConfirmation:
+        """Create and store a new pending confirmation for a mutating `ParsedCommand`.
+
+        `mode` freezes which telemetry mode (HOST_LOCAL or K8S_CLUSTER) was active when the
+        mutation was requested, so it can be redeemed against the correct execution path
+        even if the operator switches modes before confirming.
+        """
         now = datetime.now(timezone.utc)
         pending = PendingConfirmation(
             token=generate_confirmation_token(),
             command=command,
             created_at=now,
             expires_at=now + timedelta(seconds=self._ttl_seconds),
+            mode=mode,
         )
         with self._lock:
             self._prune_expired_locked()
