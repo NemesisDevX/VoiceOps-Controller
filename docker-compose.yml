@@ -15,4 +15,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    pid: "host"
+    cap_add:
+      - SYS_PTRACE
+      - NET_ADMIN
     restart: unless-stopped

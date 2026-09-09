@@ -30,6 +30,7 @@ DOMAIN_KEYTERMS = [
     "telemetry", "rollback", "latency", "socket", "isolate", "pod", "cluster", "ingress",
     "deployment", "node", "5xx error", "RPS", "OOMKilled",
 ]
+PII_POLICIES = ["passwords", "credit_card_number", "social_security_number"]
 PROVIDER_QUEUE_MAXSIZE = 8
 PROVIDER_WRITE_LIMIT = 32768
 PROVIDER_MESSAGE_MAXSIZE = 262144
@@ -152,6 +153,7 @@ class AssemblyAIStreamingSession:
                 "sample_rate": self._sample_rate, "encoding": "pcm_s16le",
                 "speech_model": SPEECH_MODEL, "format_turns": "true",
                 "keyterms_prompt": json.dumps(DOMAIN_KEYTERMS),
+                "redact_pii": "true", "pii_policies": json.dumps(PII_POLICIES),
             })
             async with asyncio.timeout(PROVIDER_BEGIN_TIMEOUT):
                 self._connection = await websocket_connect(
