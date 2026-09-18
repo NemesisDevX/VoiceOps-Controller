@@ -13,6 +13,7 @@ from app.schemas.command import ConfirmationRequest, ExecutionResult, IntentType
 from app.schemas.telemetry import ClusterTelemetry, SystemTelemetry, TelemetryMode
 from app.services import discord_alerts, system_engine
 from app.services.incident_log import incident_log
+from app.services.mitigation_stack import MitigationEntry, mitigation_stack
 from app.services.system_engine import ProcessNotFoundError, ProtectedProcessError
 
 logger = logging.getLogger(__name__)
@@ -101,12 +102,20 @@ async def confirm_command(request: ConfirmationRequest, background_tasks: Backgr
     command = pending.command
     cluster_intents = frozenset({IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE, IntentType.ROLLBACK})
 
+    rolled_entry: MitigationEntry | None = None
+    pre_snapshot: dict | None = None
+
     try:
-        if pending.mode == "K8S_CLUSTER" and command.intent in cluster_intents:
+        if command.intent is IntentType.ROLLBACK and not command.target_process_name:
+            # Bare "rollback"/"undo": reverse the newest executed mitigation from the stack.
+            result, rolled_entry = await mitigation_stack.rollback_last(dry_run=request.dry_run)
+        elif pending.mode == "K8S_CLUSTER" and command.intent in cluster_intents:
             if not command.target_process_name:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail="Pending command has no target pod name."
                 )
+            if command.intent is not IntentType.ROLLBACK:
+                pre_snapshot = await system_engine.cluster_pod_snapshot(command.target_process_name)
             result = await system_engine.cluster_execute(
                 command.intent, command.target_process_name, dry_run=request.dry_run
             )
@@ -131,7 +140,51 @@ async def confirm_command(request: ConfirmationRequest, background_tasks: Backgr
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     if not request.dry_run:
-        record = incident_log.resolve_incident(request.token, result)
+        record = incident_log.resolve_incident(
+            request.token, result, linked_token=rolled_entry.token if rolled_entry is not None else None
+        )
+        if record is not None and record.latency_waterfall:
+            result.latency_waterfall = dict(record.latency_waterfall)
+        if result.success and command.intent is not IntentType.ROLLBACK:
+            entry = _mitigation_entry(pending, command, result, pre_snapshot)
+            if entry is not None:
+                mitigation_stack.push(entry)
         if record is not None and record.success:
             background_tasks.add_task(discord_alerts.send_resolution_alert, record)
     return result
+
+
+def _mitigation_entry(
+    pending, command, result: ExecutionResult, pre_snapshot: dict | None
+) -> MitigationEntry | None:
+    """Build a reversible-mitigation record for a successful non-rollback execution."""
+    if pending.mode == "K8S_CLUSTER":
+        if command.target_process_name:
+            return MitigationEntry(
+                token=pending.token,
+                intent=command.intent,
+                mode=pending.mode,
+                target=command.target_process_name,
+                kind="cluster_pod",
+                data={"name": command.target_process_name, "snapshot": pre_snapshot},
+            )
+        return None
+    if command.intent is IntentType.PROCESS_KILL and command.target_pid is not None:
+        return MitigationEntry(
+            token=pending.token,
+            intent=command.intent,
+            mode=pending.mode,
+            target=result.affected_process_name or f"pid {command.target_pid}",
+            kind="host_process",
+            data={"pid": command.target_pid},
+        )
+    if command.intent is IntentType.NETWORK_ISOLATE and command.target_pid is not None:
+        return MitigationEntry(
+            token=pending.token,
+            intent=command.intent,
+            mode=pending.mode,
+            target=result.affected_process_name or f"pid {command.target_pid}",
+            kind="network_isolate",
+            data={"pid": command.target_pid, "ips": list(result.affected_ips)},
+        )
+    return None

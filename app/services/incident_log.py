@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 from app.schemas.command import ExecutionResult, ParsedCommand
+from app.services.latency import waterfall_tracker
 
 MAX_INCIDENTS = 200
 
@@ -44,6 +45,13 @@ class IncidentRecord(BaseModel):
     success: bool | None = Field(default=None, description="Whether the remediation succeeded, once resolved.")
     resolution_message: str | None = Field(default=None, description="The final execution result message, once resolved.")
     mttr_seconds: float | None = Field(default=None, description="Mean Time To Resolution in seconds, once resolved.")
+    latency_waterfall: dict[str, float] = Field(
+        default_factory=dict,
+        description="Pipeline latency checkpoints (t0 audio dispatch → t3 remediation), in milliseconds.",
+    )
+    linked_token: str | None = Field(
+        default=None, description="Token of the earlier incident this record rolled back, if it was a ROLLBACK."
+    )
 
 
 def _describe_target(command: ParsedCommand) -> str:
@@ -65,7 +73,9 @@ class IncidentLog:
         self._records: dict[str, IncidentRecord] = {}
         self._order: deque[str] = deque(maxlen=max_incidents)
 
-    def open_incident(self, token: str, command: ParsedCommand, mode: str) -> IncidentRecord:
+    def open_incident(
+        self, token: str, command: ParsedCommand, mode: str, waterfall: dict[str, float] | None = None
+    ) -> IncidentRecord:
         """Record the opening of a new incident when a mutating command is gated for confirmation."""
         now = datetime.now(timezone.utc)
         target = _describe_target(command)
@@ -79,6 +89,7 @@ class IncidentLog:
             language=command.language,
             timeline=[IncidentEvent(timestamp=now, message=f"Confirmation requested for '{command.raw_text}'.")],
             opened_at=now,
+            latency_waterfall=waterfall or {},
         )
         with self._lock:
             self._records[token] = record
@@ -88,7 +99,9 @@ class IncidentLog:
                 self._records.pop(stale, None)
         return record
 
-    def resolve_incident(self, token: str, result: ExecutionResult) -> IncidentRecord | None:
+    def resolve_incident(
+        self, token: str, result: ExecutionResult, linked_token: str | None = None
+    ) -> IncidentRecord | None:
         """Mark an incident resolved with the outcome of its real (non-dry-run) execution."""
         with self._lock:
             record = self._records.get(token)
@@ -99,6 +112,18 @@ class IncidentLog:
             record.success = result.success
             record.resolution_message = result.message
             record.mttr_seconds = round((now - record.opened_at).total_seconds(), 3)
+            if linked_token is not None:
+                record.linked_token = linked_token
+                record.timeline.append(
+                    IncidentEvent(timestamp=now, message=f"Rollback of prior incident '{linked_token}'.")
+                )
+            wf = record.latency_waterfall
+            if wf.get("t2_ms") is not None:
+                exec_ms = (now - record.opened_at).total_seconds() * 1000.0
+                wf["t3_ms"] = round(now.timestamp() * 1000.0, 3)
+                wf["exec_ms"] = round(exec_ms, 3)
+                wf["total_ms"] = round((wf.get("stt_ms") or 0.0) + (wf.get("gate_ms") or 0.0) + exec_ms, 3)
+                waterfall_tracker.record(dict(wf))
             record.timeline.append(
                 IncidentEvent(timestamp=now, message=f"Execution {'succeeded' if result.success else 'failed'}: {result.message}")
             )
@@ -125,6 +150,22 @@ def render_markdown(record: IncidentRecord) -> str:
     timeline_lines = "\n".join(f"- `{event.timestamp.isoformat()}` — {event.message}" for event in record.timeline)
     status = "RESOLVED" if record.resolved_at is not None else "PENDING"
     mttr = f"{record.mttr_seconds:.3f}s" if record.mttr_seconds is not None else "N/A (unresolved)"
+    wf = record.latency_waterfall
+    latency_section = ""
+    if wf.get("total_ms") is not None:
+        latency_section = f"""
+## Latency Waterfall
+
+| Checkpoint | Latency |
+| --- | --- |
+| STT (t0→t1) | {wf.get('stt_ms', 0.0):.3f} ms |
+| Intent + Safety Gate (t1→t2) | {wf.get('gate_ms', 0.0):.3f} ms |
+| Execution (t2→t3) | {wf.get('exec_ms', 0.0):.3f} ms |
+| **Total MTTR** | **{wf['total_ms']:.3f} ms** |
+"""
+    rollback_section = ""
+    if record.linked_token is not None:
+        rollback_section = f"\n**Rollback Of:** `{record.linked_token}`\n"
     return f"""# Incident Post-Mortem — {record.token}
 
 **Status:** {status}
@@ -152,7 +193,7 @@ def render_markdown(record: IncidentRecord) -> str:
 - **Success:** {record.success if record.success is not None else "N/A (unresolved)"}
 - **Resolution Message:** {record.resolution_message or "N/A (unresolved)"}
 - **Mean Time To Resolution (MTTR):** {mttr}
-"""
+{rollback_section}{latency_section}"""
 
 
 incident_log = IncidentLog()

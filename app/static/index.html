@@ -40,6 +40,20 @@
                     <header class="panel-header"><h2 id="audio-title"><span class="section-number">03</span> Voice uplink</h2><span id="voice-status" class="voice-state" role="status">OFFLINE</span></header>
                     <div class="scope"><div class="scope-label"><span>MIC / WAVEFORM</span><span id="audio-level">STANDBY</span></div><canvas id="waveform" aria-label="Live microphone waveform"></canvas><div class="scope-baseline"><span>PCM S16LE</span><span>16,000 HZ / MONO</span></div></div>
                     <div class="audio-controls"><button id="mic-toggle" class="button primary" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span id="mic-label">ENABLE MICROPHONE</span></button><p id="audio-help">Microphone access is opt-in. Audio streams to AssemblyAI only while the uplink is active.</p><p id="audio-format" class="audio-format">NATIVE INPUT &rarr; LOW-PASS &rarr; 16 KHZ PCM</p></div>
+                    <div class="waterfall" id="latency-waterfall" aria-label="Voice pipeline latency waterfall">
+                        <div class="scope-label"><span>LATENCY WATERFALL</span><span id="waterfall-total-label">MTTR —</span></div>
+                        <div class="waterfall-track" role="img" aria-label="Latency breakdown by pipeline stage">
+                            <div class="wseg" id="wseg-stt" data-stage="stt" title="Audio dispatch → transcript (STT)"></div>
+                            <div class="wseg" id="wseg-gate" data-stage="gate" title="Transcript → confirmation token (intent + gate)"></div>
+                            <div class="wseg" id="wseg-exec" data-stage="exec" title="Confirmation → remediation executed"></div>
+                        </div>
+                        <div class="waterfall-legend">
+                            <span><i class="wkey wkey-stt"></i>STT <b id="wval-stt">—</b></span>
+                            <span><i class="wkey wkey-gate"></i>GATE <b id="wval-gate">—</b></span>
+                            <span><i class="wkey wkey-exec"></i>EXEC <b id="wval-exec">—</b></span>
+                            <span class="waterfall-total">TOTAL MTTR <b id="wval-total">—</b></span>
+                        </div>
+                    </div>
                 </section>
                 <section class="panel terminal-panel" aria-labelledby="terminal-title">
                     <header class="panel-header"><h2 id="terminal-title"><span class="section-number">04</span> Command terminal</h2><div class="header-actions"><button id="export-post-mortem" class="text-button" type="button">EXPORT POST-MORTEM</button><button id="clear-feed" class="text-button" type="button">CLEAR FEED</button></div></header>

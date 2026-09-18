@@ -13,6 +13,7 @@ from app.core.security import confirmation_registry
 from app.main import create_app
 from app.schemas.telemetry import ProcessInfo
 from app.services.incident_log import incident_log
+from app.services.mitigation_stack import mitigation_stack
 
 
 @pytest.fixture
@@ -40,6 +41,13 @@ def _clear_incident_log():
     with incident_log._lock:
         incident_log._records.clear()
         incident_log._order.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_mitigation_stack():
+    """Ensure executed-mitigation rollback entries never leak between tests."""
+    yield
+    mitigation_stack.clear()
 
 
 @pytest.fixture

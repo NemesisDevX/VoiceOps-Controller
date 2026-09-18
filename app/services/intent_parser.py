@@ -12,7 +12,7 @@ import difflib
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.core.security import requires_confirmation
 from app.schemas.command import InspectionTarget, IntentType, ParsedCommand
@@ -67,8 +67,8 @@ _LEXICON: dict[IntentType, dict[str, list[str]]] = {
     },
     IntentType.ROLLBACK: {
         "en": ["rollback", "revert", "undo"],
-        "ar": ["ارجع", "الغ التعديل"],
-        "es": ["revertir"],
+        "ar": ["ارجع", "الغ التعديل", "تراجع"],
+        "es": ["revertir", "deshacer"],
         "fr": ["annuler"],
         "zh": ["回滚"],
     },
@@ -138,6 +138,26 @@ _MULTILINGUAL_PRONOUNS: dict[str, list[str]] = {
 }
 
 
+DISAMBIGUATION_TTL_SECONDS = 15
+
+_CANDIDATE_TOKEN_PATTERN = re.compile(r"[-_.\s]+")
+_MIN_CANDIDATE_TOKEN_LEN = 4
+
+
+@dataclass
+class PendingDisambiguation:
+    """A mutating intent blocked on an ambiguous target, awaiting a clarifying utterance."""
+
+    intent: IntentType
+    candidates: list[str]
+    language: str
+    expires_at: datetime
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        """Return True once the clarification window has elapsed."""
+        return (now or datetime.now(timezone.utc)) >= self.expires_at
+
+
 @dataclass
 class ConversationContext:
     """Stateful memory of the most recent INSPECT result set, used for pronoun resolution."""
@@ -146,6 +166,7 @@ class ConversationContext:
     last_subjects: list[ProcessInfo] = field(default_factory=list)
     last_inspection_target: InspectionTarget | None = None
     updated_at: datetime | None = None
+    pending_disambiguation: PendingDisambiguation | None = None
 
     def remember(self, intent: IntentType, subjects: list[ProcessInfo], target: InspectionTarget | None = None) -> None:
         """Record the results of an executed INSPECT query for later pronoun resolution."""
@@ -163,6 +184,7 @@ class ConversationContext:
         self.last_subjects = []
         self.last_inspection_target = None
         self.updated_at = None
+        self.pending_disambiguation = None
 
 
 def _detect_inspection_target(text: str) -> InspectionTarget:
@@ -335,3 +357,94 @@ class IntentParser:
     def remember_inspection(self, target: InspectionTarget, subjects: list[ProcessInfo]) -> None:
         """Update conversational memory after an INSPECT command has been executed."""
         self.context.remember(IntentType.INSPECT, subjects, target)
+
+    # --- Multi-turn disambiguation -----------------------------------------------------------
+
+    @property
+    def pending_disambiguation(self) -> PendingDisambiguation | None:
+        """Return the active clarification context, lazily expiring it once its TTL elapses."""
+        pending = self.context.pending_disambiguation
+        if pending is not None and pending.is_expired():
+            self.context.pending_disambiguation = None
+            return None
+        return pending
+
+    def set_disambiguation(
+        self,
+        intent: IntentType,
+        candidates: list[str],
+        language: str = "en",
+        ttl_seconds: float = DISAMBIGUATION_TTL_SECONDS,
+    ) -> PendingDisambiguation:
+        """Open a clarification window: `intent` is gated until one of `candidates` is named."""
+        pending = PendingDisambiguation(
+            intent=intent,
+            candidates=list(candidates),
+            language=language,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+        )
+        self.context.pending_disambiguation = pending
+        return pending
+
+    def clear_disambiguation(self) -> None:
+        """Discard any active clarification context (used when the operator changes subject)."""
+        self.context.pending_disambiguation = None
+
+    @staticmethod
+    def _candidate_score(normalized_text: str, candidate: str) -> int:
+        """Score how strongly `normalized_text` names `candidate` (0 = no match).
+
+        A full-name substring match dominates; otherwise distinctive name tokens
+        (e.g. "payment" in "payment-gateway-pod") each contribute their length so a
+        transcript like "isolate payment" resolves deterministically against the pod.
+        """
+        lowered = candidate.lower()
+        if lowered in normalized_text:
+            return len(lowered) + 1
+        return sum(
+            len(token)
+            for token in _CANDIDATE_TOKEN_PATTERN.split(lowered)
+            if len(token) >= _MIN_CANDIDATE_TOKEN_LEN and token in normalized_text
+        )
+
+    def narrow_candidates(self, text: str) -> list[str]:
+        """Return pending candidates that `text` partially names, or the full set if none match."""
+        pending = self.pending_disambiguation
+        if pending is None:
+            return []
+        normalized = unicodedata.normalize("NFKC", text.strip().lower())
+        matched = [name for name in pending.candidates if self._candidate_score(normalized, name) > 0]
+        return matched or list(pending.candidates)
+
+    def try_resolve_disambiguation(self, text: str) -> ParsedCommand | None:
+        """Resolve `text` against the pending candidate set.
+
+        Returns a `ParsedCommand` bound to the stored intent and the best-matching
+        candidate when exactly one candidate scores highest; returns None when no
+        candidate is named (caller re-prompts) or when candidates tie (still ambiguous).
+        The clarification context is cleared on a successful resolution.
+        """
+        pending = self.pending_disambiguation
+        if pending is None:
+            return None
+        normalized = unicodedata.normalize("NFKC", text.strip().lower())
+        scored = sorted(
+            ((self._candidate_score(normalized, name), name) for name in pending.candidates),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        if not scored or scored[0][0] == 0:
+            return None
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            return None
+        target = scored[0][1]
+        self.context.pending_disambiguation = None
+        return ParsedCommand(
+            raw_text=text,
+            intent=pending.intent,
+            target_process_name=target,
+            resolved_from_context=True,
+            requires_confirmation=requires_confirmation(pending.intent),
+            confidence=0.9,
+            language=pending.language,
+        )

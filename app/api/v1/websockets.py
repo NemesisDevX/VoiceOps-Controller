@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -11,12 +15,13 @@ from starlette.websockets import WebSocketState
 
 from app.core.config import get_settings
 from app.core.security import confirmation_registry
-from app.schemas.command import IntentType, ParsedCommand
-from app.schemas.telemetry import TelemetryMode
+from app.schemas.command import ExecutionResult, IntentType, ParsedCommand
+from app.schemas.telemetry import PodInfo, TelemetryMode
 from app.services import system_engine
 from app.services.assemblyai_client import AssemblyAIStreamingError, AssemblyAIStreamingSession
 from app.services.incident_log import incident_log
-from app.services.intent_parser import IntentParser
+from app.services.intent_parser import DISAMBIGUATION_TTL_SECONDS, IntentParser
+from app.services.mitigation_stack import mitigation_stack
 from app.services.system_engine import ProcessNotFoundError, ProtectedProcessError
 
 MUTATING_INTENTS = frozenset({IntentType.PROCESS_KILL, IntentType.NETWORK_ISOLATE, IntentType.ROLLBACK})
@@ -124,6 +129,8 @@ async def voice_stream(websocket: WebSocket) -> None:
     error: dict | None = None
     close_code = 1000
     accepting_turns = True
+    last_audio_at: float | None = None
+    audio_marker_ts: float | None = None
 
     async def on_turn(transcript: str, end_of_turn: bool) -> None:
         await ready_sent.wait()
@@ -131,9 +138,16 @@ async def voice_stream(websocket: WebSocket) -> None:
             return
         await sender.send_json({"type": "transcript", "text": transcript, "end_of_turn": end_of_turn})
         if end_of_turn:
+            nonlocal audio_marker_ts
+            t1 = time.time()
+            # t0 anchors the waterfall at the most recent audio packet: an explicit
+            # client "audio_marker" if one arrived, otherwise the last PCM frame the
+            # provider consumed -- i.e. the moment the operator finished speaking.
+            t0 = audio_marker_ts if (audio_marker_ts is not None and audio_marker_ts <= t1) else last_audio_at
+            audio_marker_ts = None
             broadcaster = getattr(websocket.app.state, "telemetry_broadcaster", None)
             mode = await broadcaster.get_mode() if broadcaster is not None else TelemetryMode.HOST_LOCAL
-            await _handle_command(sender, parser, transcript, mode)
+            await _handle_command(sender, parser, transcript, mode, timing={"t0": t0, "t1": t1})
 
     async def on_error(message: str, retryable: bool) -> None:
         nonlocal provider_error
@@ -146,10 +160,12 @@ async def voice_stream(websocket: WebSocket) -> None:
             raise AssemblyAIStreamingError(*provider_error)
 
     async def audio_frames():
+        nonlocal last_audio_at
         while True:
             chunk = await audio_queue.get()
             if chunk is None:
                 return
+            last_audio_at = time.time()
             yield chunk
 
     async def enqueue(chunk: bytes | None) -> None:
@@ -159,6 +175,7 @@ async def voice_stream(websocket: WebSocket) -> None:
             raise _VoiceStreamError("Audio upload is too slow. Please reconnect and try again.", True, 1013) from None
 
     async def receive_audio() -> bool:
+        nonlocal audio_marker_ts
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
@@ -167,9 +184,15 @@ async def voice_stream(websocket: WebSocket) -> None:
                 if not 1600 <= len(audio_bytes) <= 32000 or len(audio_bytes) % 2:
                     raise _VoiceStreamError("Audio frames must be PCM16, 1600 to 32000 bytes, with an even byte count.", False, 1008)
                 await enqueue(audio_bytes)
-            elif message.get("text") == "stop":
-                await enqueue(None)
-                return True
+            elif (text := message.get("text")) is not None:
+                if text == "stop":
+                    await enqueue(None)
+                    return True
+                marker_ts = _decode_audio_marker(text)
+                if marker_ts is not None:
+                    audio_marker_ts = marker_ts
+                    continue
+                raise _VoiceStreamError("Send binary PCM16 audio frames or the text 'stop'.", False, 1008)
             else:
                 raise _VoiceStreamError("Send binary PCM16 audio frames or the text 'stop'.", False, 1008)
 
@@ -250,19 +273,117 @@ async def voice_stream(websocket: WebSocket) -> None:
             pass
 
 
+def _decode_audio_marker(text: str) -> float | None:
+    """Decode a client `{"type": "audio_marker", "ts": <ms>}` control message to epoch seconds."""
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "audio_marker":
+        return None
+    ts = payload.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts <= 0:
+        return None
+    return float(ts) / 1000.0
+
+
+def _build_waterfall(timing: dict | None, t2: float) -> dict[str, float] | None:
+    """Assemble the t0→t2 latency checkpoints recorded on the voice pipeline."""
+    if not timing:
+        return None
+    t0 = timing.get("t0")
+    t1 = timing.get("t1") or t2
+    waterfall: dict[str, float] = {
+        "t1_ms": round(t1 * 1000.0, 3),
+        "t2_ms": round(t2 * 1000.0, 3),
+        "gate_ms": round(max(0.0, (t2 - t1) * 1000.0), 3),
+    }
+    if t0 is not None:
+        waterfall["t0_ms"] = round(t0 * 1000.0, 3)
+        waterfall["stt_ms"] = round(max(0.0, (t1 - t0) * 1000.0), 3)
+    return waterfall
+
+
+def _ambiguity_message(names: list[str]) -> str:
+    joined = " and ".join(names) if len(names) <= 2 else f"{', '.join(names[:-1])}, and {names[-1]}"
+    quantifier = "both" if len(names) == 2 else "all"
+    return f"Ambiguity detected: {joined} are {quantifier} degraded. Specify target."
+
+
+async def _emit_disambiguation(
+    websocket: WebSocket | _LockedSender,
+    intent: IntentType,
+    candidates: list[str],
+    language: str,
+    expires_at: datetime,
+    pods: list[PodInfo] | None = None,
+) -> None:
+    """Emit a `disambiguation_required` event carrying the unresolved candidate set."""
+    payload_candidates = (
+        [pod.model_dump(mode="json") for pod in pods] if pods is not None else [{"name": name} for name in candidates]
+    )
+    await websocket.send_json(
+        {
+            "type": "disambiguation_required",
+            "intent": intent.value,
+            "language": language,
+            "candidates": payload_candidates,
+            "expires_at": expires_at.isoformat(),
+            "message": _ambiguity_message(candidates),
+        }
+    )
+
+
+async def _degraded_pod_candidates(command: ParsedCommand) -> list[PodInfo]:
+    """Return the pods matching a target-less mutation's implied "degraded" condition.
+
+    Candidates are anomalous or memory-saturated (>=75%) pods. If the transcript already
+    names a distinctive token of some degraded pod (e.g. "payment"), the set is narrowed
+    to those matches so "isolate payment" resolves deterministically.
+    """
+    telemetry = await system_engine.get_cluster_telemetry()
+    degraded = [pod for pod in telemetry.pods if pod.anomaly or pod.memory_percent >= 75.0]
+    if len(degraded) <= 1:
+        return degraded
+    normalized = unicodedata.normalize("NFKC", command.raw_text.strip().lower())
+    matched = [pod for pod in degraded if IntentParser._candidate_score(normalized, pod.name) > 0]
+    return matched or degraded
+
+
 async def _handle_command(
     websocket: WebSocket | _LockedSender, parser: IntentParser, transcript: str,
-    mode: TelemetryMode = TelemetryMode.HOST_LOCAL,
+    mode: TelemetryMode = TelemetryMode.HOST_LOCAL, timing: dict | None = None,
 ) -> None:
     """Parse a finalized transcript and act on it: execute INSPECT queries, gate mutations."""
-    command = parser.parse(transcript)
+    pending_disambiguation = parser.pending_disambiguation
+    command: ParsedCommand | None = None
+    if pending_disambiguation is not None:
+        resolved = parser.try_resolve_disambiguation(transcript)
+        if resolved is not None and resolved.intent in MUTATING_INTENTS:
+            command = resolved
+        else:
+            fresh = parser.parse(transcript)
+            if fresh.intent is not IntentType.UNKNOWN:
+                parser.clear_disambiguation()
+                command = fresh
+            else:
+                await _emit_disambiguation(
+                    websocket,
+                    pending_disambiguation.intent,
+                    parser.narrow_candidates(transcript),
+                    pending_disambiguation.language,
+                    pending_disambiguation.expires_at,
+                )
+                return
+    if command is None:
+        command = parser.parse(transcript)
 
     if command.intent is IntentType.INSPECT:
         await _execute_inspection(websocket, parser, command, mode)
         return
 
     if command.intent in MUTATING_INTENTS:
-        await _gate_mutation(websocket, command, mode)
+        await _gate_mutation(websocket, command, mode, parser=parser, timing=timing)
         return
 
     await websocket.send_json(
@@ -298,13 +419,29 @@ async def _execute_inspection(
 
 
 async def _gate_mutation(
-    websocket: WebSocket | _LockedSender, command: ParsedCommand, mode: TelemetryMode = TelemetryMode.HOST_LOCAL
+    websocket: WebSocket | _LockedSender,
+    command: ParsedCommand,
+    mode: TelemetryMode = TelemetryMode.HOST_LOCAL,
+    parser: IntentParser | None = None,
+    timing: dict | None = None,
 ) -> None:
     cluster_mode = mode is TelemetryMode.K8S_CLUSTER
-    target_label = command.target_process_name if cluster_mode else command.target_pid
+    rollback_preview: ExecutionResult | None = None
 
-    if cluster_mode and command.intent is IntentType.ROLLBACK and not command.target_process_name:
-        target_label = None
+    if command.intent is IntentType.ROLLBACK and not command.target_process_name:
+        # Bare multilingual "rollback"/"undo" reverses the newest executed mitigation.
+        rollback_preview = await mitigation_stack.preview_rollback()
+        if rollback_preview is None:
+            await websocket.send_json(
+                {
+                    "type": "command_result",
+                    "success": False,
+                    "intent": command.intent.value,
+                    "language": command.language,
+                    "message": "No prior mitigation is available to roll back.",
+                }
+            )
+            return
     elif not cluster_mode and command.intent is IntentType.ROLLBACK:
         await websocket.send_json(
             {
@@ -313,43 +450,67 @@ async def _gate_mutation(
             }
         )
         return
+    elif cluster_mode and not command.target_process_name:
+        # A target-less cluster mutation ("kill the failing pod") resolves against the
+        # degraded pod set; multiple matches gate on operator disambiguation instead of
+        # failing or picking arbitrarily.
+        candidates = await _degraded_pod_candidates(command)
+        if len(candidates) > 1:
+            names = [pod.name for pod in candidates]
+            if parser is not None:
+                pending_disamb = parser.set_disambiguation(command.intent, names, language=command.language)
+                expires_at = pending_disamb.expires_at
+            else:
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=DISAMBIGUATION_TTL_SECONDS)
+            await _emit_disambiguation(
+                websocket, command.intent, names, command.language, expires_at, pods=candidates
+            )
+            return
+        if candidates:
+            command.target_process_name = candidates[0].name
+            command.resolved_from_context = True
 
-    if target_label is None:
-        await websocket.send_json(
-            {
-                "type": "command_result",
-                "success": False,
-                "intent": command.intent.value,
-                "language": command.language,
-                "message": "No target process could be identified for this command.",
-            }
-        )
-        return
+    if rollback_preview is not None:
+        preview = rollback_preview
+    else:
+        target_label = command.target_process_name if cluster_mode else command.target_pid
+        if target_label is None:
+            await websocket.send_json(
+                {
+                    "type": "command_result",
+                    "success": False,
+                    "intent": command.intent.value,
+                    "language": command.language,
+                    "message": "No target process could be identified for this command.",
+                }
+            )
+            return
 
-    try:
-        if cluster_mode:
-            preview = await system_engine.cluster_execute(command.intent, command.target_process_name, dry_run=True)
-        elif command.intent is IntentType.PROCESS_KILL:
-            preview = await system_engine.terminate_process(command.target_pid, dry_run=True)
-        else:
-            preview = await system_engine.isolate_network(command.target_pid, dry_run=True)
-    except ProtectedProcessError as exc:
-        await websocket.send_json(
-            {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
-        )
-        return
-    except ProcessNotFoundError as exc:
-        await websocket.send_json(
-            {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
-        )
-        return
+        try:
+            if cluster_mode:
+                preview = await system_engine.cluster_execute(command.intent, command.target_process_name, dry_run=True)
+            elif command.intent is IntentType.PROCESS_KILL:
+                preview = await system_engine.terminate_process(command.target_pid, dry_run=True)
+            else:
+                preview = await system_engine.isolate_network(command.target_pid, dry_run=True)
+        except ProtectedProcessError as exc:
+            await websocket.send_json(
+                {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
+            )
+            return
+        except ProcessNotFoundError as exc:
+            await websocket.send_json(
+                {"type": "command_result", "success": False, "intent": command.intent.value, "language": command.language, "message": str(exc)}
+            )
+            return
 
-    if not preview.success:
-        await websocket.send_json({"type": "command_result", "language": command.language, **preview.model_dump(mode="json")})
-        return
+        if not preview.success:
+            await websocket.send_json({"type": "command_result", "language": command.language, **preview.model_dump(mode="json")})
+            return
 
+    waterfall = _build_waterfall(timing, time.time())
     pending = confirmation_registry.register(command, mode=mode.value)
-    incident_log.open_incident(pending.token, command, mode.value)
+    incident_log.open_incident(pending.token, command, mode.value, waterfall=waterfall)
     await websocket.send_json(
         {
             "type": "confirmation_required",
@@ -359,5 +520,6 @@ async def _gate_mutation(
             "token": pending.token,
             "expires_at": pending.expires_at.isoformat(),
             "preview": preview.model_dump(mode="json"),
+            "waterfall": waterfall,
         }
     )

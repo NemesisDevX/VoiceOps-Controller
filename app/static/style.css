@@ -157,3 +157,21 @@ dialog h2 { margin: 24px 24px 10px; font-size: 25px; }
 @media (max-width: 800px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .workspace { grid-template-columns: 1fr; } .page-heading { align-items: flex-start; } .safety-indicator { display: none; } .audio-panel { grid-row: 1; } .scope { margin-top: 16px; } #waveform { height: 110px; } .audio-controls { padding-bottom: 18px; } .panel-meta { display: inline; } .statusbar { flex-wrap: wrap; font-size: 7px; } #transport-summary { display: none; } .panel-footer { font-size: 8px; } .table-scroll { min-height: 240px; } }
 @media (max-width: 480px) { .app-shell { padding: 0 14px; } .topbar { min-height: 80px; gap: 12px; } .brand { font-size: 18px; gap: 10px; } .brand small { font-size: 6px; } .brand-mark { width: 36px; height: 36px; } #utc-clock { display: none; } .status-badge { padding: 7px; font-size: 8px; } .metrics { gap: 10px; } .metric-reading strong { font-size: 29px; } .sparkline { width: 48px; } .metric-label { font-size: 8px; letter-spacing: .5px; } .metric-reading .network-glyph { font-size: 16px; } .metric-reading { gap: 5px; } .metric-card { padding: 16px 12px; } .metric-card p { font-size: 9px; } .panel-header, .table-toolbar { padding-inline: 14px; } .panel-footer { flex-wrap: wrap; gap: 7px; padding-inline: 14px; } .panel-meta { font-size: 7px; } .terminal-feed { padding-inline: 12px; } .feed-entry { grid-template-columns: 54px 48px minmax(0, 1fr); gap: 6px; font-size: 10px; } .feed-time, .feed-tag { font-size: 8px; } .modal-actions { flex-direction: column-reverse; } .modal-actions button { width: 100%; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
+
+/* Latency waterfall: live t0→t3 pipeline breakdown rendered inside the voice uplink panel. */
+.waterfall { border-top: 1px solid var(--line); padding: 14px 20px 18px; }
+.waterfall-track { display: flex; height: 12px; margin-top: 10px; background: #0a1118; border: 1px solid #22303c80; overflow: hidden; }
+.wseg { width: 0%; height: 100%; transition: width .35s ease; }
+.wseg[data-stage="stt"] { background: linear-gradient(90deg, #55e5cf66, #55e5cf); }
+.wseg[data-stage="gate"] { background: linear-gradient(90deg, #f3bb6655, #f3bb66); }
+.wseg[data-stage="exec"] { background: linear-gradient(90deg, #2ecc7166, #2ecc71); }
+.wseg[data-pending="true"] { background: repeating-linear-gradient(45deg, #22303c, #22303c 4px, #141d26 4px, #141d26 8px); }
+.waterfall-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font: 9px var(--mono); letter-spacing: .5px; color: var(--muted); }
+.waterfall-legend b { color: var(--text); font-weight: 400; margin-left: 4px; }
+.wkey { display: inline-block; width: 7px; height: 7px; margin-right: 5px; }
+.wkey-stt { background: var(--cyan); }
+.wkey-gate { background: var(--amber); }
+.wkey-exec { background: #2ecc71; }
+.waterfall-total { margin-left: auto; color: #2ecc71; text-shadow: 0 0 8px #2ecc7166; }
+.waterfall-total b { color: #2ecc71; }
+#waterfall-total-label { color: #2ecc71; }

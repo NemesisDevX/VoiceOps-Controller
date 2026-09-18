@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketState
 
 from app.schemas.telemetry import ClusterTelemetry, SystemTelemetry, TelemetryMode
 from app.services import system_engine
+from app.services.latency import waterfall_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,9 @@ class TelemetryBroadcaster:
             telemetry = await system_engine.get_system_telemetry(self._top_process_limit)
             payload = telemetry.model_dump(mode="json")
         payload["mode"] = mode.value
+        waterfall = waterfall_tracker.latest()
+        if waterfall is not None:
+            payload["waterfall"] = waterfall
         return payload
 
     async def _run(self) -> None:

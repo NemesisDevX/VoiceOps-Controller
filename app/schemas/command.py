@@ -81,6 +81,12 @@ class ExecutionResult(BaseModel):
     dry_run: bool = Field(default=False, description="True if this result reflects a dry-run evaluation only.")
     affected_pid: int | None = Field(default=None, description="PID affected by the action, if applicable.")
     affected_process_name: str | None = Field(default=None, description="Process name affected, if applicable.")
+    affected_ips: list[str] = Field(
+        default_factory=list, description="Remote IPs blocked by a NETWORK_ISOLATE execution, if applicable."
+    )
+    latency_waterfall: dict[str, float] | None = Field(
+        default=None, description="Sub-second latency checkpoints (t0→t3) measured across the voice pipeline."
+    )
     processes: list[ProcessInfo] = Field(
         default_factory=list, description="Process listing returned by an INSPECT query."
     )

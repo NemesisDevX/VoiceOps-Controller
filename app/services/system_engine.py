@@ -309,7 +309,54 @@ async def isolate_network(pid: int, dry_run: bool = False) -> ExecutionResult:
         dry_run=False,
         affected_pid=pid,
         affected_process_name=info.name,
+        affected_ips=remote_ips,
     )
+
+
+def _unblock_ip(ip: str) -> None:
+    """Remove the outbound firewall rule previously installed for `ip` by `_block_ip`."""
+    if sys.platform == "win32":
+        rule_name = f"voiceops-isolate-{ip.replace('.', '-').replace(':', '-')}"
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    else:
+        subprocess.run(
+            ["iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+
+def _unblock_ips_sync(ips: list[str]) -> list[str]:
+    """Synchronously remove isolation rules for `ips`; returns the IPs actually unblocked."""
+    removed: list[str] = []
+    for ip in ips:
+        try:
+            _unblock_ip(ip)
+        except (subprocess.SubprocessError, OSError) as exc:
+            message = f"Failed to remove outbound firewall rule for {ip}. {_failure_reason(exc)}"
+            if removed:
+                message += f" Rules already removed for {', '.join(removed)}."
+            raise _FirewallRuleError(message) from exc
+        removed.append(ip)
+    return removed
+
+
+async def unblock_ips(ips: list[str]) -> list[str]:
+    """Remove previously-installed isolation rules for `ips`. Returns the IPs unblocked.
+
+    Idempotent at the semantic level: re-removing a rule that no longer exists is treated
+    as success by the underlying firewall tools on both platforms (netsh delete exits 0
+    for absent rules; iptables -D is wrapped best-effort below).
+    """
+    if not ips:
+        return []
+    return await asyncio.to_thread(_unblock_ips_sync, ips)
 
 
 # --------------------------------------------------------------------------------------
@@ -430,6 +477,32 @@ class ClusterSimulator:
             pods=[pod.to_info() for pod in self.pods.values()],
         )
 
+    def snapshot_pod(self, pod_name: str) -> dict | None:
+        """Capture a pod's mutable state so a later ROLLBACK can restore it verbatim."""
+        pod = self.pods.get(pod_name)
+        if pod is None:
+            return None
+        return {
+            "name": pod.name,
+            "status": pod.status,
+            "cpu_percent": pod.cpu_percent,
+            "memory_percent": pod.memory_percent,
+            "restarts": pod.restarts,
+            "anomaly": pod.anomaly,
+        }
+
+    def restore_pod_snapshot(self, snapshot: dict) -> bool:
+        """Restore a pod to the exact state captured by `snapshot_pod`. Returns False if absent."""
+        pod = self.pods.get(snapshot.get("name", ""))
+        if pod is None:
+            return False
+        pod.status = snapshot["status"]
+        pod.cpu_percent = snapshot["cpu_percent"]
+        pod.memory_percent = snapshot["memory_percent"]
+        pod.restarts = snapshot["restarts"]
+        pod.anomaly = snapshot["anomaly"]
+        return True
+
     def recover_pod(self, pod_name: str) -> None:
         """Immediately clear a pod's anomaly and normalize cluster-wide metrics."""
         pod = self.pods[pod_name]
@@ -515,6 +588,39 @@ async def cluster_execute(intent: IntentType, target_name: str, dry_run: bool = 
         success=True,
         intent=intent,
         message=f"{action_done} pod '{pod.name}'.{recovery_note}",
+        dry_run=False,
+        affected_process_name=pod.name,
+    )
+
+
+async def cluster_pod_snapshot(target_name: str) -> dict | None:
+    """Return a pre-mutation snapshot of `target_name`'s pod state, or None if absent."""
+    return _cluster_simulator.snapshot_pod(target_name)
+
+
+async def cluster_restore_pod(target_name: str, snapshot: dict | None) -> ExecutionResult:
+    """Restore a pod to its pre-mutation snapshot during a voice-driven ROLLBACK.
+
+    Raises `ProcessNotFoundError` if `target_name` is not a known pod, mirroring
+    `cluster_execute`'s error contract.
+    """
+    pod = _cluster_simulator.pods.get(target_name)
+    if pod is None:
+        raise ProcessNotFoundError(f"Pod '{target_name}' was not found in the simulated cluster.")
+
+    if snapshot is not None:
+        _cluster_simulator.restore_pod_snapshot(snapshot)
+    else:
+        # No snapshot retained: fall back to a canonical healthy state.
+        pod.status = "Running"
+        pod.anomaly = False
+        pod.cpu_percent = min(pod.cpu_percent, 15.0)
+        pod.memory_percent = min(pod.memory_percent, 25.0)
+
+    return ExecutionResult(
+        success=True,
+        intent=IntentType.ROLLBACK,
+        message=f"Restored pod '{pod.name}' to its pre-mitigation state.",
         dry_run=False,
         affected_process_name=pod.name,
     )

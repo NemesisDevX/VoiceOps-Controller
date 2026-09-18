@@ -335,9 +335,12 @@ const SRE_ACKNOWLEDGEMENTS = {
 };
 
 function speak(kind, language = "en") {
-    if (!globalThis.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return;
     const phrase = (SRE_ACKNOWLEDGEMENTS[kind] ?? SRE_ACKNOWLEDGEMENTS.gate)[language] ?? SRE_ACKNOWLEDGEMENTS[kind]?.en ?? "";
-    if (!phrase) return;
+    speakRaw(phrase, language);
+}
+
+function speakRaw(phrase, language = "en") {
+    if (!phrase || !globalThis.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") return;
     try {
         const utterance = new SpeechSynthesisUtterance(phrase);
         utterance.lang = SPEECH_LOCALES[language] ?? "en-US";
@@ -508,9 +511,34 @@ function bootDashboard() {
         });
     }
 
+    function renderWaterfall(waterfall) {
+        if (!waterfall || typeof waterfall !== "object") return;
+        const segments = [
+            ["stt", Number.isFinite(waterfall.stt_ms) ? waterfall.stt_ms : 0],
+            ["gate", Number.isFinite(waterfall.gate_ms) ? waterfall.gate_ms : 0],
+            ["exec", Number.isFinite(waterfall.exec_ms) ? waterfall.exec_ms : null],
+        ];
+        const known = segments.reduce((sum, [, value]) => sum + (value ?? 0), 0);
+        const total = Number.isFinite(waterfall.total_ms) ? waterfall.total_ms : known;
+        const denominator = Math.max(total, known, 1);
+        for (const [key, value] of segments) {
+            const bar = $(`wseg-${key}`);
+            const label = $(`wval-${key}`);
+            if (!bar || !label) continue;
+            bar.style.width = value === null ? "0%" : `${Math.max(value > 0 ? 3 : 0, (value / denominator) * 100)}%`;
+            label.textContent = value === null ? "PENDING" : `${value.toFixed(1)}ms`;
+            bar.dataset.pending = String(value === null);
+        }
+        const totalLabel = $("wval-total");
+        const headline = $("waterfall-total-label");
+        if (totalLabel) totalLabel.textContent = `${total.toFixed(1)}ms`;
+        if (headline) headline.textContent = `MTTR ${total.toFixed(1)}ms`;
+    }
+
     function updateTelemetry(data) {
         const mode = data.mode === "K8S_CLUSTER" ? "K8S_CLUSTER" : "HOST_LOCAL";
         if (mode !== telemetryMode) applyModeChrome(mode);
+        if (data.waterfall) renderWaterfall(data.waterfall);
         if (mode === "K8S_CLUSTER") {
             if (!Array.isArray(data.pods) || ![data.rps, data.p99_latency_ms, data.error_rate_5xx].every(Number.isFinite)) throw new Error("Invalid cluster telemetry");
             telemetry = data;
@@ -629,6 +657,7 @@ function bootDashboard() {
             if (dryRun && response.ok && result.success) $("confirmation-summary").textContent = result.message;
             if (dryRun && (!response.ok || result.success !== true)) invalidated = true;
             if (!dryRun) {
+                if (result.latency_waterfall) renderWaterfall(result.latency_waterfall);
                 const kind = response.ok && result.success
                     ? request.intent === "ROLLBACK" ? "rollback" : request.intent === "NETWORK_ISOLATE" ? "isolate" : "terminate"
                     : "failed";
@@ -666,8 +695,19 @@ function bootDashboard() {
                     log("voice", "VOICE", message.text);
                     $("partial-transcript").textContent = "Awaiting voice input";
                 } else $("partial-transcript").textContent = String(message.text).slice(0, 2000);
-            } else if (message.type === "confirmation_required") showConfirmation(message);
-            else if (message.type === "command_result") {
+            } else if (message.type === "confirmation_required") {
+                if (message.waterfall) renderWaterfall(message.waterfall);
+                showConfirmation(message);
+            } else if (message.type === "disambiguation_required") {
+                const names = (Array.isArray(message.candidates) ? message.candidates : []).map(candidate => candidate?.name ?? candidate).filter(Boolean);
+                log("gate", "AMBIGUITY", message.message ?? "Ambiguous target.");
+                for (const name of names) log("gate", "CANDIDATE", name);
+                $("partial-transcript").textContent = names.length ? `Specify target: ${names.join(" / ")}` : "Specify target";
+                const spoken = names.length >= 2
+                    ? `Ambiguity detected: ${names.slice(0, -1).join(", ")} and ${names.at(-1)} are both degraded. Specify target.`
+                    : message.message ?? "Ambiguous target. Specify target.";
+                speakRaw(spoken, message.language);
+            } else if (message.type === "command_result") {
                 log(message.success ? "result" : "error", "INTENT", `${message.intent} / ${message.message}`);
                 if (Array.isArray(message.processes)) {
                     for (const process of message.processes.slice(0, 50)) log("result", "PROCESS", `PID ${process.pid} / ${process.name} / CPU ${Number(process.cpu_percent).toFixed(1)}% / RAM ${Number(process.memory_percent).toFixed(1)}%`);
