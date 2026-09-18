@@ -360,7 +360,7 @@ async def unblock_ips(ips: list[str]) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------
-# Kubernetes cluster sandbox (Phase 3): a fully simulated, in-memory "cluster" used to
+# Kubernetes cluster sandbox: a fully simulated, in-memory "cluster" used to
 # demonstrate dual-mode telemetry and mutation without touching any real infrastructure.
 # Nothing below this line reads or mutates real host state.
 # --------------------------------------------------------------------------------------

@@ -222,7 +222,7 @@ def test_french_rollback_sets_language() -> None:
 
 def test_chinese_process_kill_substring_matches_without_spaces() -> None:
     # Note: a space is kept before the PID digits because `_BARE_NUMBER_PATTERN`'s `\b` boundary
-    # (correctly, per requirement 6) does not fire between two adjacent Unicode "word" characters
+    # (correctly) does not fire between two adjacent Unicode "word" characters
     # such as a Chinese ideograph directly abutting a digit; the *verb* itself ("终止") is still
     # matched purely by substring containment with no surrounding whitespace required.
     parser = IntentParser()

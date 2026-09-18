@@ -167,7 +167,7 @@ def test_confirm_rejects_non_mutating_pending_command(client: TestClient) -> Non
 
 
 # --------------------------------------------------------------------------------------
-# Phase 3: dual-mode telemetry (HOST_LOCAL / K8S_CLUSTER) and cluster sandbox endpoints.
+# Dual-mode telemetry (HOST_LOCAL / K8S_CLUSTER) and cluster sandbox endpoints.
 # --------------------------------------------------------------------------------------
 
 

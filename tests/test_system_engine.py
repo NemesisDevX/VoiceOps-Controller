@@ -361,7 +361,7 @@ async def test_isolate_partial_failure_discloses_installed_rules(monkeypatch, sa
 
 
 # --------------------------------------------------------------------------------------
-# Phase 3: simulated Kubernetes cluster sandbox (dual-mode telemetry & mutation).
+# Simulated Kubernetes cluster sandbox (dual-mode telemetry & mutation).
 # --------------------------------------------------------------------------------------
 
 

@@ -3,7 +3,7 @@
 Every mutating voice command that reaches the confirmation gate is recorded as an
 `IncidentRecord`. When the operator redeems the confirmation token for a real (non-dry-run)
 execution, the record is marked resolved and its Mean Time To Resolution (MTTR) is computed.
-This is a Phase 1-style, single-process, in-memory store; a distributed deployment would
+This is a single-process, in-memory store; a distributed deployment would
 back this with a shared, durable incident store.
 """
 

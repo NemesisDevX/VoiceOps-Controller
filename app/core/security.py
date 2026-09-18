@@ -51,7 +51,7 @@ def generate_confirmation_token() -> str:
 class ConfirmationRegistry:
     """Thread-safe, in-memory store of pending confirmations awaiting operator sign-off.
 
-    Tokens are single-use and expire after `ttl_seconds`. This is a Phase 1, single-process
+    Tokens are single-use and expire after `ttl_seconds`. This is a single-process
     implementation; a distributed deployment would back this with a shared cache (e.g. Redis).
     """
 

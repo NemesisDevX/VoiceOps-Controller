@@ -85,7 +85,7 @@ _INTENT_MATCH_ORDER: tuple[IntentType, ...] = (
 )
 _LANG_ORDER: tuple[str, ...] = ("en", "ar", "es", "fr", "zh")
 
-# Fuzzy resolution (requirement 3) is restricted to the Latin-script language family (English,
+# Fuzzy resolution is restricted to the Latin-script language family (English,
 # Spanish, French) so that acoustic slips like "kilit"/"stopp"/"terminador" still resolve to the
 # right intent. Arabic and Chinese are matched exclusively by exact/substring containment above;
 # comparing their glyphs against Latin candidates with `difflib` would be meaningless and could
@@ -230,7 +230,7 @@ class IntentParser:
             return self._parse_inspection(text, normalized, language="en")
 
         # Multilingual extension: exact/substring lexicon matches across all five languages,
-        # falling back to Latin-script fuzzy matching for acoustic slips (see requirement 3/6).
+        # falling back to Latin-script fuzzy matching for acoustic slips (see `_match_multilingual`).
         intent, language = self._match_multilingual(normalized)
         if intent is IntentType.INSPECT:
             return self._parse_inspection(text, normalized, language=language or "en")

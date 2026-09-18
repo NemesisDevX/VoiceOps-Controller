@@ -15,7 +15,7 @@
     <div class="app-shell">
         <header class="topbar">
             <a class="brand" href="/" aria-label="VoiceOps dashboard"><span class="brand-mark" aria-hidden="true">&gt;_</span><span>VOICE<span class="accent">OPS</span><small>INFRASTRUCTURE CONTROL</small></span></a>
-            <div class="topbar-right"><span class="environment">LOCAL NODE <span>/</span> PHASE 03</span><div class="segmented" id="mode-toggle" role="group" aria-label="Telemetry mode"><button id="mode-host" type="button" aria-pressed="true">HOST_LOCAL</button><button id="mode-cluster" type="button" aria-pressed="false">K8S_CLUSTER</button></div><span class="status-badge" id="telemetry-status" role="status" data-state="connecting"><i></i>CONNECTING</span><time id="utc-clock">--:--:-- UTC</time></div>
+            <div class="topbar-right"><span class="environment">LOCAL NODE <span>/</span> OPERATOR</span><div class="segmented" id="mode-toggle" role="group" aria-label="Telemetry mode"><button id="mode-host" type="button" aria-pressed="true">HOST_LOCAL</button><button id="mode-cluster" type="button" aria-pressed="false">K8S_CLUSTER</button></div><span class="status-badge" id="telemetry-status" role="status" data-state="connecting"><i></i>CONNECTING</span><time id="utc-clock">--:--:-- UTC</time></div>
         </header>
         <main id="main">
             <section class="page-heading" aria-labelledby="page-title">
@@ -63,7 +63,7 @@
                 <aside class="panel protocol-panel" aria-labelledby="protocol-title">
                     <header class="panel-header"><h2 id="protocol-title"><span class="section-number">05</span> Operator protocol</h2><span class="panel-meta">QUICK REFERENCE</span></header>
                     <ol class="protocol-list"><li><span>01</span><div><h3>Inspect the incident</h3><p>“Show me the top memory processes”</p><p>“Which processes use the most CPU?”</p></div></li><li><span>02</span><div><h3>Choose a response</h3><p>“Kill it” resolves to the last query's top process.</p><p>Or specify: “Isolate PID 4242”</p></div></li><li><span>03</span><div><h3>Review. Then authorize.</h3><p>Check the target and dry-run summary. Only the confirmation button executes an action.</p></div></li></ol>
-                    <div class="protocol-note">LOCAL OPERATOR MODE<span>Use on a trusted host. This Phase 2 console does not provide multi-user authentication.</span></div>
+                    <div class="protocol-note">LOCAL OPERATOR MODE<span>Use on a trusted host. This console does not provide multi-user authentication.</span></div>
                 </aside>
             </div>
         </main>

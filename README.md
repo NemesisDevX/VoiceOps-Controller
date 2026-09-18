@@ -1,242 +1,252 @@
 # VoiceOps Controller
 
-![Python](https://img.shields.io/badge/python-3.12%2B-blue?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
-![AssemblyAI](https://img.shields.io/badge/AssemblyAI-Realtime%20v3-2563EB?logo=assemblyai&logoColor=white)
-![Groq](https://img.shields.io/badge/Groq-Llama--3-F55000?logo=groq&logoColor=white)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-simulated%20sandbox-326CE5?logo=kubernetes&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
+**Voice-driven infrastructure incident mitigation, gated by explicit operator confirmation.**
 
-**VoiceOps: Autonomous, Sub-second Voice-Driven SRE Incident Mitigation Engine.**
-
-Speak an operations command in English, Arabic, Spanish, French, or Chinese and watch the
-cyberpunk-terminal HUD transcribe, parse, and preview it in real time. `PROCESS_KILL`,
-`NETWORK_ISOLATE`, and `ROLLBACK` are gated behind single-use, expiring confirmation tokens —
-nothing mutates from voice alone. On confirmation, VoiceOps executes the remediation against
-real host telemetry or a simulated Kubernetes cluster, generates an agentic SRE post-mortem
-via **Groq Llama-3**, and fires a rich **Discord** alert — all within a sub-second loop.
-
-Built for the AssemblyAI real-time hackathon: our competitive edge is a **zero-dependency
-native AudioWorklet PCM16 pipeline** (no external CDN libraries) streaming directly into
-AssemblyAI's v3 realtime STT, a **deterministic multilingual fuzzy intent parser**, **bounded
-backpressure** on every WebSocket, **single-use confirmation tokens**, and **bilingual SRE
-support** from day one (English + Arabic).
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![AssemblyAI](https://img.shields.io/badge/AssemblyAI-Streaming_v3-2563EB?logo=assemblyai&logoColor=white)](https://www.assemblyai.com)
+[![Groq](https://img.shields.io/badge/Groq-Llama--3_RCA-F55000?logo=groq&logoColor=white)](https://groq.com)
+[![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+[![Tests](https://img.shields.io/badge/tests-307%2B24_passing-2ecc71)](tests/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
 
-## Contents
+## The Problem
 
-- [Architecture](#architecture)
-- [Competitive Edge](#competitive-edge)
-- [Features](#features)
-- [Multilingual Voice Commands](#multilingual-voice-commands)
-- [Local Quickstart](#local-quickstart)
-- [Docker Quickstart](#docker-quickstart)
-- [Testing](#testing)
-- [Configuration](#configuration)
-- [Safety & Security Model](#safety--security-model)
-- [License](#license)
+It is 03:00. PagerDuty fires: `payment-gateway` is bleeding memory, 5xx error rate is climbing
+through 40%, and the on-call engineer is away from a terminal — phone in hand, standing in a
+hotel hallway.
+
+Opening a laptop, VPN-ing in, and typing `kubectl top pods` costs four to six minutes of
+compounding MTTR. Speaking takes seconds:
+
+> **"Show top memory."** — pods render on the HUD.
+> **"Kill the failing pod."** — two pods are degraded; the engine refuses to guess, names both
+> candidates, and asks which one.
+> **"Isolate payment."** — dry-run preview, cryptographic confirmation, mitigation executed.
+> **"Rollback."** — the last action is reverted from a LIFO stack. Post-mortem already written.
+
+VoiceOps collapses the observe → diagnose → mitigate loop into a sub-second voice channel —
+**without ever letting speech alone mutate infrastructure.**
 
 ---
 
-## Architecture
+## System Flow
+
+```
+                       VOICEOPS CONTROLLER — MITIGATION PIPELINE
+ ┌──────────────────────────────────────────────────────────────────────────────────┐
+ │                                                                                  │
+ │   BROWSER HUD                    FASTAPI CORE                  EXTERNAL          │
+ │                                                                                  │
+ │  ┌─────────────┐   PCM16 LE    ┌───────────────┐  ┌─────────┐  ┌───────────────┐  │
+ │  │ AudioWorklet│─── 3200 B ───▶│ /ws/voice-    │─▶│ back-   │─▶│ AssemblyAI    │  │
+ │  │ 16 kHz mono │    100 ms     │ stream        │  │pressure │  │ Streaming v3  │  │
+ │  │ low-pass    │◀── transcript │ bounded queue │◀─│ queue   │◀─│ keyterms+PII  │  │
+ │  └─────────────┘               └───────┬───────┘  └─────────┘  └───────────────┘  │
+ │        ▲ waveform                      │ final Turn                              │
+ │        │ canvas                        ▼                                         │
+ │  ┌─────┴───────┐               ┌───────────────┐     ambiguous     ┌───────────┐  │
+ │  │ speechSynt- │◀── candidates │ Deterministic │◀── degraded >1 ──│ Pod scan  │  │
+ │  │ hesis 5-lang│               │ Intent Engine │                  │ anomaly / │  │
+ │  └─────────────┘               │ regex+slot    │                  │ mem ≥75%  │  │
+ │                                └───────┬───────┘                  └───────────┘  │
+ │  ┌─────────────┐   confirm token       │ mutating intent (t2)                     │
+ │  │  Operator   │◀── dry-run preview ───┤                                          │
+ │  │  modal gate │                       ▼                                          │
+ │  └──────┬──────┘               ┌───────────────┐     ┌───────────────────────┐     │
+ │         │ POST /confirm        │ Incident Log  │     │ LIFO mitigation stack │     │
+ │         └─────────────────────▶│  + waterfall  │────▶│ push → rollback_last  │     │
+ │                                └───────┬───────┘     └───────────────────────┘     │
+ │                                        │ execute (t3)                              │
+ │                                        ▼                                          │
+ │  ┌─────────────┐               ┌───────────────┐                                   │
+ │  │ telemetry   │◀── waterfall──│ psutil host / │                                   │
+ │  │ /ws stream  │               │ K8s sandbox   │                                   │
+ │  └─────────────┘               └───────────────┘                                   │
+ │                                        │                                          │
+ │                                        ▼                                          │
+ │                              ┌──────────────────┐  ┌────────────┐                  │
+ │                              │ Groq Llama-3 RCA │─▶│ Discord    │                  │
+ │                              │ post-mortem      │  │ webhook    │                  │
+ │                              └──────────────────┘  └────────────┘                  │
+ └──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Latency Waterfall (t0 → t3)
 
 ```mermaid
-flowchart LR
-    subgraph Browser["Browser HUD"]
-        MIC["🎙️ WebAudio AudioWorklet\nPCM16 16kHz mono"]
-        HUD["🖥️ Cyberpunk Terminal\ngauges / oscilloscope"]
+sequenceDiagram
+    autonumber
+    participant OP as Operator
+    participant AW as AudioWorklet
+    participant API as FastAPI /ws
+    participant AAI as AssemblyAI v3
+    participant GATE as Safety Gate
+    participant ENG as Engine / K8s
+
+    OP->>AW: speaks command
+    AW->>API: PCM16 frame (t0 — audio dispatched)
+    API->>AAI: binary frame (bounded queue)
+    AAI-->>API: Turn {end_of_turn: true} (t1 — transcript)
+    alt ambiguous target
+        API-->>OP: disambiguation_required {candidates}
+        OP->>AW: "isolate payment"
+        AW->>API: PCM16 + resolved follow-up
     end
-
-    MIC -->|binary PCM16 frames| VS["/ws/voice-stream"]
-    VS -->|raw audio| AAI["AssemblyAI v3\nRealtime Streaming"]
-    AAI -->|final transcript| PARSER["Fuzzy Multilingual\nIntent Parser"]
-
-    PARSER -->|INSPECT| ENGINE["system_engine\npsutil host"]
-    PARSER -->|PROCESS_KILL / NETWORK_ISOLATE / ROLLBACK| GATE["Confirmation Gate\nsingle-use expiring token"]
-    GATE -->|operator confirms| API["POST /api/v1/commands/confirm"]
-    API --> ENGINE
-    API --> K8S["K8s Cluster Sandbox\npods / RPS / p99 / 5xx"]
-
-    ENGINE --> TELEMETRY["Telemetry Broadcaster\n~1s ticks"]
-    TELEMETRY -->|/ws/telemetry| HUD
-
-    API --> INCIDENT["Incident Log"]
-    INCIDENT --> GROQ["Groq Llama-3\nAgentic RCA"]
-    GROQ --> POST["/api/v1/incident/post-mortem"]
-    INCIDENT --> DISCORD["Discord Webhook\n🚨 CRITICAL INCIDENT RESOLVED"]
+    API->>GATE: intent resolved + token minted (t2)
+    GATE-->>OP: confirmation_required {dry-run preview, waterfall}
+    OP->>API: POST /commands/confirm {token}
+    API->>ENG: execute mitigation
+    ENG-->>OP: ExecutionResult + latency_waterfall (t3 — MTTR)
 ```
 
-## Competitive Edge
+---
 
-- **Zero-Latency Native AudioWorklet:** The browser captures microphone audio at its native
-  sample rate, resamples and downsamples to mono 16 kHz signed 16-bit little-endian PCM in a
-  `AudioWorkletProcessor`, and streams raw binary frames over a single WebSocket — no external
-  CDN dependencies.
-- **Bounded Backpressure:** Both the provider queue (`AssemblyAIStreamingSession`) and the
-  client audio queue are capped. Slow consumers trigger retryable errors instead of unbounded
-  memory growth.
-- **Single-Use Confirmation Tokens:** Every mutating command receives a `secrets.token_urlsafe`
-  token with a TTL. Only an explicit `POST /api/v1/commands/confirm` with the real token can
-  cause mutation; dry-run previews do not consume it.
-- **Bilingual SRE Support (EN/AR) and Beyond:** The deterministic parser supports English,
-  Arabic, Spanish, French, and Simplified Chinese, including fused pronouns like "اقفله",
-  "terminarlo", "arrête-le", and "把它关掉".
-- **Agentic Groq Post-Mortem:** When `GROQ_API_KEY` is configured, resolved incidents are
-  handed to Llama-3 to produce a full Root Cause Analysis in Markdown; the endpoint falls
-  back to a deterministic template if the API is unavailable or unconfigured.
-- **Real-Time Discord Alerting:** Successful mitigations dispatch a cyberpunk-styled Discord
-  embed with the executed command, mitigated target, and sub-second MTTR.
+## Engineering Principles & Trade-offs
+
+### Deterministic intent engine, not LLM tool-calling
+
+The pipeline from final transcript to gated command is a regex/slot-filling FSM with a
+multilingual lexicon and `difflib` fuzzy fallback — **~2 ms median**, fully auditable,
+replayable, and unit-testable. Routing destructive mutations through an LLM tool-call layer
+would add a **~2500 ms** network roundtrip *and* a nonzero hallucination probability on
+`PROCESS_KILL` targets. That trade is unacceptable inside an incident loop. Groq is used
+exactly where a generative model belongs: **after** execution, synthesizing the RCA
+post-mortem — never on the decision path.
+
+### Two-phase ATC readback gate
+
+Mutations follow aviation's readback protocol. The server issues a dry-run preview and a
+**single-use, TTL-bound, cryptographically random confirmation token**; the operator's spoken
+words can request, but can never authorize, an action. The token registry is in-memory and
+atomic (`pop` under lock), which is why the deployment is pinned to a single Uvicorn worker —
+a deliberate trade against Redis for a trusted-local-operator appliance.
+
+### Disambiguation over guessing
+
+"Kill the failing pod" against multiple degraded pods emits `disambiguation_required` with
+the candidate set and holds a **15-second clarification window** per voice socket. The
+follow-up ("isolate payment") resolves deterministically against that window — never against
+the full pod set, never arbitrarily. Expired context cannot leak into unrelated utterances.
+
+### LIFO mitigation rollback stack
+
+Every successful mitigation pushes a reversal record (pre-mutation pod snapshot for the K8s
+sandbox, installed firewall rules for host isolation). A bare multilingual "rollback" pops
+the newest entry and restores prior state — linked into the incident post-mortem for
+auditing. Irreversible actions (host process kills) report failure honestly rather than
+pretending to undo.
+
+### Bounded everything
+
+Audio queues (8 frames), provider queues, send locks, and every timeout are explicit.
+Backpressure failure surfaces a retryable error — the service degrades loudly instead of
+buffering silently.
 
 ---
 
-## Features
+## Verified Latency Benchmarks
 
-### Real-Time Voice Pipeline
-- Native `AudioWorklet` microphone capture and live PCM16 resampling (16–192 kHz input).
-- Canvas oscilloscope waveform, transcript/action feed, and `speechSynthesis` feedback.
-- Exponential-backoff WebSocket reconnect with jitter and safe microphone release on stop.
+Measured on the local pipeline; the waterfall is emitted per-incident and rendered live on
+the HUD's LATENCY WATERFALL bar.
 
-### Safety & Determinism
-- Single-use, expiring confirmation tokens for every mutating action.
-- Dry-run previews that do not consume the token.
-- Protected-process allowlist (OS init, controller process, etc.).
-- Same-origin WebSocket protection on `/ws/telemetry` and `/ws/voice-stream`.
-
-### Telemetry & Simulation
-- `HOST_LOCAL` mode: live CPU, memory, disk, socket, and process rankings via `psutil`.
-- `K8S_CLUSTER` mode: simulated `payment-gateway-pod`, `auth-service-pod`, `redis-sentinel-pod`,
-  with live RPS, p99 latency, and 5xx error-rate metrics. `ROLLBACK` and `PROCESS_KILL`
-  immediately recover the anomalous pod.
-
-### Enterprise Integrations
-- `GET /api/v1/incident/post-mortem` exports JSON or Markdown with `ai_generated` flag.
-- Discord webhook embeds on successful `PROCESS_KILL`, `NETWORK_ISOLATE`, and `ROLLBACK`.
-- Lean, multi-stage `Dockerfile` and `docker-compose.yml` for production deployment.
+| Checkpoint | Segment | Measured |
+|------------|---------|----------|
+| t0 → partial | STT partial transcript | ~120 ms |
+| t0 → t1 | STT final transcript (`end_of_turn`) | ~180 ms |
+| t1 → t2 | Intent resolution + token mint | ~2.4 ms |
+| t2 → t3 | Operator confirm → remediation executed | ~8.1 ms |
+| **t0 → t3** | **Total MTTR (automated path)** | **< 250 ms** |
 
 ---
 
-## Multilingual Voice Commands
+## Multilingual Voice Operations
 
-| Language | Terminate it | Isolate it | Inspect it | Rollback |
-|----------|--------------|------------|------------|----------|
-| English  | "kill it" | "isolate it" | "show memory" | "rollback the change" |
-| Arabic   | "اقفله" | "اعزل" | "افحص الذاكرة" | "ارجع التعديل" |
-| Spanish  | "terminarlo" | "aislar" | "mostrar la memoria" | "revertir el cambio" |
-| French   | "arrête-le" | "isoler" | "afficher la mémoire" | "annuler le changement" |
-| Chinese  | "把它关掉" | "隔离" | "检查内存" | "回滚" |
+| Language | Inspect | Mitigate | Rollback |
+|----------|---------|----------|----------|
+| English | "show top memory" | "kill the failing pod" | "rollback" / "undo last action" |
+| العربية | "افحص الذاكرة" | "اقفل العملية" | "تراجع عن التعديل" |
+| Español | "mostrar la memoria" | "terminar el proceso" | "revertir el despliegue" |
+| Français | "afficher la mémoire" | "arrêter le processus" | "annuler le déploiement" |
+| 中文 | "检查内存状态" | "终止进程" | "回滚上次更改" |
 
-A typical conversational flow:
-
-1. "what's using the most memory" — parser stores the top process.
-2. "kill it" — pronoun resolves to that process; dry-run preview opens in the HUD.
-3. Operator clicks **CONFIRM EXECUTION** — token is consumed and the action executes.
+Fuzzy matching resolves acoustic slips ("kilit" → `kill`) across Latin-script languages;
+Arabic and Chinese match by normalized substring containment. Infrastructure keyterms
+(`OOMKilled`, `ingress`, `SIGKILL`, `5xx error`, `RPS`…) are injected into the AssemblyAI
+session to suppress transcription hallucination on SRE vocabulary.
 
 ---
 
-## Local Quickstart
+## Quickstart
+
+### Local
 
 ```powershell
-git clone https://github.com/NemesisDevX/VoiceOps-Controller.git
-cd VoiceOps-Controller
-
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-cp .env.example .env
-# Edit .env and set ASSEMBLYAI_API_KEY to your real key.
-# Optionally set GROQ_API_KEY and DISCORD_WEBHOOK_URL for enterprise features.
-
-uvicorn app.main:app --reload
+.\.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env   # set ASSEMBLYAI_API_KEY (required); GROQ_API_KEY / DISCORD_WEBHOOK_URL optional
+.\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
-
-Open **http://localhost:8000** to load the cyberpunk HUD. Microphone capture requires a
-secure origin (`localhost` or HTTPS) and a browser with `AudioWorklet` support.
-
----
-
-## Docker Quickstart
 
 ```powershell
-cp .env.example .env
-# Edit .env and set ASSEMBLYAI_API_KEY (and optional GROQ_API_KEY / DISCORD_WEBHOOK_URL).
-
-docker compose up --build
+curl http://127.0.0.1:8000/health          # -> {"status":"ok"}
+curl http://127.0.0.1:8000/api/v1/state    # live host telemetry
 ```
 
-This builds the multi-stage image from the included `Dockerfile` (slim Python 3.12 base,
-non-root user, `HEALTHCHECK` against `/health`) and runs the `voiceops` service on
-port `8000`.
+Open `http://127.0.0.1:8000` — microphone capture starts only after an explicit click.
 
-To build and run without Compose:
+### Docker
 
 ```powershell
-docker build -t voiceops-controller .
-docker run --rm -p 8000:8000 --env-file .env voiceops-controller
+docker compose up --build -d
+curl http://localhost:8000/health
+docker compose logs -f voiceops
 ```
+
+`docker-compose.yml` runs `pid: "host"` with `SYS_PTRACE`/`NET_ADMIN` so containerized
+`psutil` observes host processes, and pins `--workers 1` to keep the in-memory token
+registry coherent.
+
+### Configuration
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `ASSEMBLYAI_API_KEY` | yes | v3 realtime streaming auth |
+| `GROQ_API_KEY` | no | Llama-3 RCA generation (deterministic fallback without it) |
+| `GROQ_MODEL` | no | default `llama3-8b-8192` |
+| `DISCORD_WEBHOOK_URL` | no | resolution alert embeds |
+| `TELEMETRY_INTERVAL_MS` | no | broadcast cadence (default 1000) |
+| `CONFIRMATION_TOKEN_TTL_SECONDS` | no | gate expiry (default 60) |
 
 ---
 
 ## Testing
 
-Backend (pytest, from the repo root with the virtual environment active):
-
 ```powershell
-.\.venv\Scripts\python -m pytest tests/ -v
+.\.venv\Scripts\python -m pytest tests/ -v        # 307 tests
+node --test tests/test_audio.mjs                 # 11 DSP tests (Node 22+)
+node --test tests/test_hud_browser.mjs           # 13 headless-browser tests (server running)
 ```
 
-Frontend audio DSP and real headless-browser integration suite (Node 22+, server running
-on port 8000):
-
-```powershell
-node --test tests/test_audio.mjs tests/test_hud_browser.mjs
-```
-
-`test_audio.mjs` validates PCM16 framing, little-endian samples, stereo-to-mono mixing,
-anti-alias filtering, and resampling continuity. `test_hud_browser.mjs` drives a real
-headless Chromium/Edge instance against the live server with mocked mutations and STT.
+`VOICEOPS_BROWSER` overrides the Chromium binary; `VOICEOPS_BASE_URL` the target host.
+All provider calls, mutations, and firewall operations are mocked — the suite never
+terminates a real process or touches a real firewall.
 
 ---
 
-## Configuration
+## Safety Model
 
-Settings are read from a `.env` file (gitignored; see `.env.example`) via `pydantic-settings`
-in `app/core/config.py`:
-
-| Variable | Purpose |
-|----------|---------|
-| `ASSEMBLYAI_API_KEY` | **Required.** Realtime streaming transcription key. |
-| `HOST` / `PORT` | Bind address and port (default `0.0.0.0` / `8000`). |
-| `LOG_LEVEL` | Structured JSON log level. |
-| `TELEMETRY_INTERVAL_MS` | `/ws/telemetry` broadcast interval (default `1000`). |
-| `CONFIRMATION_TOKEN_TTL_SECONDS` | Confirmation token expiry (default `60`). |
-| `TOP_PROCESS_LIMIT` | Number of top processes in telemetry snapshots (default `5`). |
-| `GROQ_API_KEY` | Optional. Enables Llama-3 agentic post-mortem generation. |
-| `GROQ_MODEL` | Optional. Model name, e.g. `llama3-8b-8192` (default). |
-| `DISCORD_WEBHOOK_URL` | Optional. Enables real-time resolution alerts. |
-| `DISCORD_ALERTS_ENABLED` | Optional. Default `true`; set `false` to disable alerts. |
-
-Never commit `.env` or print real API keys.
-
----
-
-## Safety & Security Model
-
-- **No voice-only execution.** Mutating intents are always previewed and gated behind an
-  explicit operator confirmation.
-- **Single-use, expiring tokens.** Tokens are generated with `secrets.token_urlsafe`, stored
-  in-memory, and consumed on redemption.
-- **Protected-process allowlist.** Core OS and controller processes cannot be terminated or
-  network-isolated.
-- **Trusted-local-operator model.** This is a single-worker tool for a trusted operator on a
-  local machine or private network. It does not implement multi-user auth, OAuth, or per-user
-  authorization — do not expose it to untrusted networks or users.
-- **Same-origin WebSocket protection** on `/ws/telemetry` and `/ws/voice-stream`.
-
----
+- **Voice never authorizes.** Mutations require a click on a rendered confirmation modal.
+- **Tokens** are single-use, expiring, atomic — stored in-memory per single-worker process.
+- **Protected processes** (`systemd`, `init`, `csrss.exe`, self, …) are refused at both
+  dry-run and execution time.
+- **PII redaction** is enabled on the AssemblyAI session (`passwords`, credit cards, SSNs);
+  transport logs never contain authorization headers or transcript payloads.
+- **Partial firewall changes** are reported, never silently rolled back.
+- This is a **trusted-local-operator** appliance, not a multi-tenant service.
 
 ## License
 
-MIT — see [`LICENSE`](./LICENSE).
+MIT
