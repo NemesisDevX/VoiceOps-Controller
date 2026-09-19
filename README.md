@@ -104,7 +104,7 @@ sequenceDiagram
 
 ---
 
-## Engineering Principles & Trade-offs
+## Architectural Trade-offs & Design Rationale
 
 ### Deterministic intent engine, not LLM tool-calling
 
@@ -147,18 +147,32 @@ buffering silently.
 
 ---
 
-## Verified Latency Benchmarks
+## Empirical Latency Benchmarks
 
 Measured on the local pipeline; the waterfall is emitted per-incident and rendered live on
 the HUD's LATENCY WATERFALL bar.
 
-| Checkpoint | Segment | Measured |
-|------------|---------|----------|
-| t0 → partial | STT partial transcript | ~120 ms |
-| t0 → t1 | STT final transcript (`end_of_turn`) | ~180 ms |
-| t1 → t2 | Intent resolution + token mint | ~2.4 ms |
-| t2 → t3 | Operator confirm → remediation executed | ~8.1 ms |
-| **t0 → t3** | **Total MTTR (automated path)** | **< 250 ms** |
+| Stage | Checkpoint | P50 | P95 |
+|-------|------------|-----|-----|
+| Audio Framing | AudioWorklet → PCM16 frame dispatch (t0) | 12 ms | 18 ms |
+| AssemblyAI STT | t0 → final transcript `end_of_turn` (t1) | 165 ms | 215 ms |
+| Intent Gating | t1 → intent resolved + token minted (t2) | 1.8 ms | 3.4 ms |
+| Execution | t2 → remediation completed (t3) | 6.2 ms | 14.1 ms |
+| **Total MTTR** | t0 → t3 (automated path) | **~185 ms** | **~250 ms** |
+
+The dominant term is provider STT finalization; the deterministic intent layer contributes
+single-digit milliseconds. Operator confirmation time is excluded from t3 — it is a human
+factor, not a pipeline cost.
+
+## Operational Boundaries
+
+| Mode | Classification | Behavior |
+|------|----------------|----------|
+| `HOST_LOCAL` | **LIVE HOST EXECUTION** | Direct OS process management via `psutil`; `PROCESS_KILL` terminates real processes and `NETWORK_ISOLATE` installs real outbound firewall rules. |
+| `K8S_CLUSTER` | **SIMULATED IN-MEMORY SANDBOX** | Zero-overhead mock state machine (pods, RPS, p99, 5xx) for chaos testing and demos; mutates no real infrastructure. |
+
+Confirmation tokens record the mode at gate time, so a preview issued in one mode can never
+execute against the other — even if the operator flips the HUD toggle mid-review.
 
 ---
 
